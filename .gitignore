@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.release-work/
+.env
+/assest/
+/output/
+/cpptest/_deps/
+/cpptest/build-native/
+/cpptest/output/
+*.pyc
+*.dll
+*.exe
+*.lib
+*.pdb
+*.zip
