@@ -8,4 +8,4 @@
 
 Windows 发布包随附 OpenCV 4.10.0 x64 SDK 的 `opencv_world4100.dll`，其许可证随包保存在 `OpenCV-LICENSE.txt`。对应源码与官方 SDK 见 [OpenCV 4.10.0](https://github.com/opencv/opencv/releases/tag/4.10.0)。
 
-当前发布包的项目源码及构建脚本由同一 Git 标签提供。[v1.0.0 源码与发行版](https://github.com/Ayn1631/genshin-video-guide-hud/releases/tag/v1.0.0)
+发布包的项目源码及构建脚本由对应的 Git 标签提供。[源码与发行版](https://github.com/Ayn1631/genshin-video-guide-hud/releases)

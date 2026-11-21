@@ -39,4 +39,19 @@ if(WIN32 AND MSVC)
     target_compile_definitions(bgi_window_capture PRIVATE NOMINMAX)
     target_compile_options(bgi_window_capture PRIVATE /W4 /utf-8 /permissive-)
     target_link_libraries(bgi_window_capture PRIVATE d3d11 windowsapp)
+
+    add_executable(GenshinVideoGuideHUD WIN32
+        native_app.cpp native_settings.cpp native_pipeline.cpp
+        native_game.cpp native_video.cpp native_hud.cpp)
+    target_compile_features(GenshinVideoGuideHUD PRIVATE cxx_std_17)
+    target_compile_definitions(GenshinVideoGuideHUD PRIVATE
+        NOMINMAX UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
+    target_compile_options(GenshinVideoGuideHUD PRIVATE /W4 /utf-8 /permissive-)
+    target_link_libraries(GenshinVideoGuideHUD PRIVATE locator_core bgi_window_capture
+        gdiplus gdi32 user32 dwmapi winhttp windowsapp crypt32 ole32 shell32 comctl32 uuid)
+    if(TARGET opencv_world)
+        add_custom_command(TARGET GenshinVideoGuideHUD POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:opencv_world>" "$<TARGET_FILE_DIR:GenshinVideoGuideHUD>")
+    endif()
 endif()
