@@ -9,6 +9,15 @@
 
 namespace guide {
 
+struct DiagnosticSection {
+    std::wstring title;
+    std::wstring text;
+
+    bool operator==(const DiagnosticSection& other) const noexcept {
+        return title == other.title && text == other.text;
+    }
+};
+
 struct HudView {
     std::wstring title;
     std::wstring detail;
@@ -16,7 +25,7 @@ struct HudView {
     std::optional<double> distance;
     std::optional<POINT> marker;  // Absolute screen pixels.
     std::optional<double> marker_heading;  // Degrees clockwise from up.
-    std::vector<std::wstring> diagnostics;
+    std::vector<DiagnosticSection> diagnostics;
 };
 
 class Hud {

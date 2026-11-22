@@ -23,10 +23,11 @@ using namespace Gdiplus;
 constexpr int compass_width = 760;
 constexpr int compass_height = 134;
 constexpr int marker_size = 25;
-constexpr int diagnostics_width = 286;
-constexpr int diagnostics_row_height = 20;
-constexpr int diagnostics_padding = 10;
-constexpr double diagnostics_min_scale = 0.6;
+constexpr int diagnostics_width = 312;
+constexpr REAL diagnostics_padding = 12.0f;
+constexpr REAL diagnostics_text_width = diagnostics_width - 2 * diagnostics_padding;
+constexpr REAL diagnostics_heading_height = 24.0f;
+constexpr REAL diagnostics_section_gap = 13.0f;
 constexpr double radians_per_degree = 3.14159265358979323846 / 180.0;
 
 [[noreturn]] void throw_last_error(const char* message) {
@@ -427,7 +428,54 @@ void paint_marker(Graphics& graphics, int, int, const MarkerContent& content) {
     graphics.DrawEllipse(&border_pen, x - 4.0f, y - 4.0f, 8.0f, 8.0f);
 }
 
-void paint_diagnostics(Graphics& graphics, int width, int height, const std::vector<std::wstring>& lines) {
+struct DiagnosticsText {
+    const FontFamily chinese{L"Microsoft YaHei UI"};
+    const FontFamily segoe{L"Segoe UI"};
+    const FontFamily* family = chinese.IsAvailable() ? &chinese : &segoe;
+    const Font heading{family, 15.0f, FontStyleBold, UnitPixel};
+    const Font body{family, 13.0f, FontStyleRegular, UnitPixel};
+    StringFormat format;
+
+    DiagnosticsText() { format.SetTrimming(StringTrimmingNone); }
+};
+
+struct DiagnosticsLayout {
+    std::vector<DiagnosticSection> sections;
+    std::vector<REAL> text_heights;
+    REAL height = 2 * diagnostics_padding;
+
+    bool operator==(const DiagnosticsLayout& other) const noexcept {
+        return sections == other.sections;
+    }
+};
+
+DiagnosticsLayout measure_diagnostics(const std::vector<DiagnosticSection>& sections) {
+    Bitmap bitmap(1, 1, PixelFormat32bppPARGB);
+    Graphics graphics(&bitmap);
+    graphics.SetPageUnit(UnitPixel);
+    graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    const DiagnosticsText style;
+    DiagnosticsLayout layout;
+    layout.sections = sections;
+    layout.text_heights.reserve(sections.size());
+    for (const auto& section : sections) {
+        const RectF line_area(0, 0, diagnostics_text_width, 0);
+        RectF text_bounds;
+        if (graphics.MeasureString(section.text.c_str(), -1, &style.body, line_area,
+                                   &style.format, &text_bounds) != Ok) {
+            throw std::runtime_error("Could not measure HUD diagnostics");
+        }
+        const REAL text_height = std::ceil(text_bounds.Height) + 1.0f;
+        layout.text_heights.push_back(text_height);
+        layout.height += diagnostics_heading_height + text_height;
+    }
+    if (!sections.empty()) {
+        layout.height += diagnostics_section_gap * static_cast<REAL>(sections.size() - 1);
+    }
+    return layout;
+}
+
+void paint_diagnostics(Graphics& graphics, int width, int height, const DiagnosticsLayout& layout) {
     const auto scale = static_cast<REAL>(width) / diagnostics_width;
     graphics.ScaleTransform(scale, scale);
     const REAL right = diagnostics_width - 1.0f;
@@ -444,33 +492,44 @@ void paint_diagnostics(Graphics& graphics, int width, int height, const std::vec
     graphics.FillPath(&background, &path);
     graphics.DrawPath(&border, &path);
 
-    const FontFamily chinese(L"Microsoft YaHei UI");
-    const FontFamily segoe(L"Segoe UI");
-    const Font font(chinese.IsAvailable() ? &chinese : &segoe, 13.0f, FontStyleRegular, UnitPixel);
-    auto y = static_cast<REAL>(diagnostics_padding);
-    for (const auto& line : lines) {
-        if (y + diagnostics_row_height / 2.0f > bottom - diagnostics_padding) {
-            break;
+    const DiagnosticsText style;
+    const SolidBrush heading(Color(255, 174, 216, 250));
+    const SolidBrush body(Color(245, 228, 241, 255));
+    const Pen divider(Color(82, 157, 194, 224), 1.0f);
+    auto y = diagnostics_padding;
+    for (std::size_t i = 0; i < layout.sections.size(); ++i) {
+        if (i != 0) {
+            const REAL separator = y + diagnostics_section_gap / 2;
+            graphics.DrawLine(&divider, diagnostics_padding, separator,
+                              diagnostics_padding + diagnostics_text_width, separator);
+            y += diagnostics_section_gap;
         }
-        draw_text(graphics, line, font, RectF(12.0f, y, right - 23.0f, diagnostics_row_height),
-                  StringAlignmentNear, Color(245, 228, 241, 255));
-        y += diagnostics_row_height;
+        const auto& section = layout.sections[i];
+        graphics.DrawString(section.title.c_str(), -1, &style.heading,
+                            RectF(diagnostics_padding, y, diagnostics_text_width, diagnostics_heading_height),
+                            &style.format, &heading);
+        y += diagnostics_heading_height;
+        const auto text_height = layout.text_heights[i];
+        graphics.DrawString(section.text.c_str(), -1, &style.body,
+                            RectF(diagnostics_padding, y, diagnostics_text_width, text_height),
+                            &style.format, &body);
+        y += text_height;
     }
 }
 
-std::optional<RECT> diagnostics_bounds(const RECT& game, int width, int height, std::size_t count) {
+std::optional<RECT> diagnostics_bounds(const RECT& game, int width, int height, REAL content_height) {
     const int margin = std::max(8, static_cast<int>(std::lround(height * 0.014)));
     const int offset = static_cast<int>(std::lround(height * 0.23));
     const int available_height = height - offset - margin;
     const double available_width = static_cast<double>(width - 2 * margin) / diagnostics_width;
-    const double scale = std::min({1.3, std::max(0.7, height / 950.0), available_width});
-    if (!count || scale < diagnostics_min_scale ||
-        available_height < (2 * diagnostics_padding + diagnostics_row_height) * scale) {
+    const double scale = std::min({1.3, std::max(0.7, height / 950.0), available_width,
+                                  static_cast<double>(available_height) / content_height});
+    const int panel_width = static_cast<int>(std::floor(diagnostics_width * scale));
+    if (panel_width <= 0) {
         return std::nullopt;
     }
-    const double units = 2 * diagnostics_padding + static_cast<double>(count) * diagnostics_row_height;
-    const int panel_width = static_cast<int>(std::lround(diagnostics_width * scale));
-    const int panel_height = static_cast<int>(std::lround(std::min(static_cast<double>(available_height), units * scale)));
+    const int panel_height = std::min(available_height, static_cast<int>(std::ceil(
+        static_cast<double>(panel_width) * content_height / diagnostics_width)));
     return RECT{game.left + margin, game.top + offset, game.left + margin + panel_width,
                 game.top + offset + panel_height};
 }
@@ -485,7 +544,8 @@ struct Hud::Impl {
     WindowClass window_class;
     Layer<CompassContent> compass;
     Layer<MarkerContent> marker;
-    Layer<std::vector<std::wstring>> diagnostics;
+    Layer<DiagnosticsLayout> diagnostics;
+    std::optional<DiagnosticsLayout> diagnostics_layout;
 };
 
 Hud::Hud(HINSTANCE instance) : impl_(std::make_unique<Impl>(instance)) {}
@@ -537,12 +597,21 @@ void Hud::show(const RECT& game, const HudView& view) {
             impl_->marker.hide();
         }
 
-        const auto timing_rect = diagnostics_bounds(game, static_cast<int>(width), static_cast<int>(height),
-                                                   view.diagnostics.size());
-        if (timing_rect) {
-            impl_->diagnostics.show(*timing_rect, view.diagnostics, paint_diagnostics);
-        } else {
+        if (view.diagnostics.empty()) {
             impl_->diagnostics.hide();
+            impl_->diagnostics_layout.reset();
+        } else {
+            auto& layout = impl_->diagnostics_layout;
+            if (!layout || layout->sections != view.diagnostics) {
+                layout = measure_diagnostics(view.diagnostics);
+            }
+            const auto timing_rect = diagnostics_bounds(game, static_cast<int>(width), static_cast<int>(height),
+                                                        layout->height);
+            if (timing_rect) {
+                impl_->diagnostics.show(*timing_rect, *layout, paint_diagnostics);
+            } else {
+                impl_->diagnostics.hide();
+            }
         }
     } catch (...) {
         hide();

@@ -242,18 +242,21 @@ std::wstring decimal(double value) {
     return text;
 }
 
-void diagnostics(std::vector<std::wstring>& output, const std::wstring& name,
-                 const Stream& stream, Clock::time_point now) {
-    output.push_back(name + L"  " + decimal(stream.captures.at(now)) + L" 帧/秒取帧  ·  "
-        + decimal(stream.matches.at(now)) + L" 帧/秒匹配  ·  " + decimal(stream.locations.at(now)) + L" 帧/秒定位");
-    output.push_back(L"取帧 " + decimal(stream.capture_ms) + L" ms  ·  匹配 "
-        + decimal(stream.match_ms) + L" ms  ·  视角 " + decimal(stream.heading_ms) + L" ms");
+DiagnosticSection diagnostics(const std::wstring& name, const Stream& stream, Clock::time_point now) {
+    DiagnosticSection section{name + L"流程",
+        L"取帧  " + decimal(stream.captures.at(now)) + L"\u00A0FPS  ·  "
+        + decimal(stream.capture_ms) + L"\u00A0ms\n"
+        + L"匹配  " + decimal(stream.matches.at(now)) + L"\u00A0FPS  ·  "
+        + decimal(stream.match_ms) + L"\u00A0ms\n"
+        + L"定位  " + decimal(stream.locations.at(now)) + L"\u00A0FPS  ·  视角  "
+        + decimal(stream.heading_ms) + L"\u00A0ms"};
     if (!stream.capture_status.empty()) {
-        output.push_back(stream.capture_status);
+        section.text += L"\n" + stream.capture_status;
     }
     if (!stream.match_status.empty()) {
-        output.push_back(stream.match_status);
+        section.text += L"\n" + stream.match_status;
     }
+    return section;
 }
 
 HudView make_view(const GuideSettings& settings, const RECT& bounds, const Stream& video,
@@ -261,8 +264,7 @@ HudView make_view(const GuideSettings& settings, const RECT& bounds, const Strea
     const auto now = Clock::now();
     HudView view;
     if (settings.detailed) {
-        diagnostics(view.diagnostics, L"攻略", video, now);
-        diagnostics(view.diagnostics, L"玩家", player, now);
+        view.diagnostics = {diagnostics(L"攻略", video, now), diagnostics(L"玩家", player, now)};
     }
     if (now - player.frame_at > player_age || !player.capture_status.empty()) {
         view.title = L"游戏画面未检测到小地图";
