@@ -24,6 +24,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-VideoFrame preview_edge(const GuideSettings& settings, int timeout_ms = 1400, HANDLE stop_event = nullptr);
+std::vector<CaptureWindow> available_capture_windows();
+VideoFrame preview_capture_window(const GuideSettings& settings, int timeout_ms = 1400, HANDLE stop_event = nullptr);
 
 }

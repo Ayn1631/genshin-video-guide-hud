@@ -5,10 +5,13 @@
 #include "map_locator.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <string_view>
 
 namespace guide {
 
 enum class CaptureMode { remote, wake, windows };
+enum class EdgeEndpointMode { automatic, directory, port };
 
 inline constexpr double min_capture_fps = 0.1;
 inline constexpr double max_capture_fps = 120;
@@ -33,6 +36,19 @@ struct VideoCircle {
     double radius = 95.1;
 };
 
+struct CaptureWindow {
+    std::uintptr_t handle = 0;
+    std::uint32_t process_id = 0;
+    std::wstring executable;
+    std::wstring window_class;
+    std::wstring title;
+};
+
+struct WindowMinimap {
+    NormalizedRect bounds;
+    double inset_fraction = 0;
+};
+
 inline std::optional<NormalizedRect> bounded_video_rect(NormalizedRect rect) {
     constexpr double tolerance = 0.00000001;
     if (!(rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0
@@ -50,6 +66,11 @@ struct GuideSettings {
     std::wstring game_title = L"原神";
     std::wstring edge_pattern = L"bilibili\\.com";
     CaptureMode capture_mode = CaptureMode::remote;
+    EdgeEndpointMode edge_endpoint = EdgeEndpointMode::automatic;
+    std::wstring edge_debug_directory;
+    std::uint16_t edge_debug_port = 0;
+    std::optional<CaptureWindow> capture_window;
+    std::optional<WindowMinimap> window_minimap;
     NormalizedRect video_rect;
     VideoCircle circle;
     double inset = 11.4;
@@ -71,6 +92,8 @@ void save_settings(const std::filesystem::path& root, const GuideSettings& setti
 bool valid_assets(const std::filesystem::path& directory);
 std::wstring setting_number(double value);
 std::optional<double> parse_setting_number(const std::wstring& value);
+std::optional<std::uint16_t> parse_edge_debug_port(std::wstring_view value);
+std::filesystem::path expand_edge_debug_directory(const std::wstring& value);
 int run_hud_worker(HINSTANCE instance, const GuideSettings& settings,
                    const std::filesystem::path& root, HANDLE stop_event);
 

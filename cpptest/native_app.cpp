@@ -1,4 +1,5 @@
 #include "native_types.hpp"
+#include "native_calibration.hpp"
 #include "native_video.hpp"
 
 #include <commctrl.h>
@@ -7,8 +8,6 @@
 #include <shobjidl.h>
 #include <windowsx.h>
 #include <wrl/client.h>
-
-#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <array>
@@ -24,11 +23,12 @@ namespace {
 
 using guide::GuideSettings;
 using guide::NormalizedRect;
+using guide::EdgeEndpointMode;
+using guide::CalibrationKind;
 using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t settings_class[] = L"GenshinVideoGuideHUD.Settings";
 constexpr wchar_t window_title[] = L"原神视频攻略 HUD 设置";
-constexpr wchar_t preview_class[] = L"GenshinVideoGuideHUD.Preview";
 constexpr int form_width = 768;
 constexpr int form_height = 600;
 constexpr std::array<const wchar_t*, 3> tab_names{L"重试与帧率", L"Edge 和小地图", L"高级"};
@@ -40,12 +40,14 @@ enum Control : int {
     video_fps, player_fps, local_misses, region_misses, arrival,
     method, workers, opencv_threads, cache_indexes, detailed, status,
     save, stop, start, settings_tabs, restore, edge_help, filter_label, hud_rate, hud_rate_caption,
-    video_rect_status, hud_rate_formula
+    video_rect_status, hud_rate_formula, debug_mode, debug_directory, debug_browse, debug_port,
+    capture_window, select_minimap, minimap_help
 };
 
 enum class Page { tracking, edge, advanced, shared };
 enum class Font { body, note, section, title, value, count };
 enum class ControlKind { plain, edit, combo, button };
+enum class Visibility { always, window_capture, window_video, debug, auto_debug, manual_directory, manual_port };
 enum class Status { info, running, error };
 
 struct Layout {
@@ -197,208 +199,6 @@ private:
     Handle stop_, job_, process_;
 };
 
-class Preview {
-public:
-    Preview(HINSTANCE instance, HWND parent, const cv::Mat& image, NormalizedRect selection)
-        : selection_(selection) {
-        cv::cvtColor(image, pixels_, cv::COLOR_BGR2BGRA);
-        WNDCLASSEXW cls{};
-        cls.cbSize = sizeof(cls);
-        cls.hInstance = instance;
-        cls.lpfnWndProc = procedure;
-        cls.lpszClassName = preview_class;
-        cls.hCursor = LoadCursorW(nullptr, IDC_CROSS);
-        cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-        RegisterClassExW(&cls);
-        MONITORINFO display{};
-        display.cbSize = sizeof(display);
-        GetMonitorInfoW(MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST), &display);
-        const auto& area = display.rcWork;
-        const int width = std::min(1000L, area.right - area.left - 40);
-        const int height = std::min(680L, area.bottom - area.top - 40);
-        HWND window = CreateWindowExW(WS_EX_TOOLWINDOW, preview_class, L"框选攻略视频画面",
-            WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX, area.left + (area.right - area.left - width) / 2,
-            area.top + (area.bottom - area.top - height) / 2, width, height, parent, nullptr, instance, this);
-        if (!window) {
-            throw std::runtime_error("preview window unavailable");
-        }
-        ShowWindow(window, SW_SHOW);
-    }
-
-    ~Preview() {
-        if (window_) {
-            DestroyWindow(window_);
-        }
-    }
-
-    bool open() const { return window_ != nullptr; }
-    std::optional<NormalizedRect> result() const { return accepted_ ? std::optional(selection_) : std::nullopt; }
-
-    bool handle_key(MSG& message) const {
-        if (!window_ || GetAncestor(message.hwnd, GA_ROOT) != window_) {
-            return false;
-        }
-        if (message.message == WM_KEYDOWN && message.wParam == VK_ESCAPE) {
-            DestroyWindow(window_);
-            return true;
-        }
-        return IsDialogMessageW(window_, &message) != FALSE;
-    }
-
-private:
-    static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
-        if (message == WM_NCCREATE) {
-            auto* self = static_cast<Preview*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
-            self->window_ = window;
-            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
-        }
-        auto* self = reinterpret_cast<Preview*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-        return self ? self->handle(message, wparam, lparam) : DefWindowProcW(window, message, wparam, lparam);
-    }
-
-    LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
-        switch (message) {
-        case WM_CREATE: {
-            constexpr auto button_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
-            cancel_ = CreateWindowW(L"BUTTON", L"取消", button_style | BS_PUSHBUTTON,
-                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(IDCANCEL), nullptr, nullptr);
-            button_ = CreateWindowW(L"BUTTON", L"使用此区域", button_style | BS_DEFPUSHBUTTON,
-                0, 0, 0, 0, window_, reinterpret_cast<HMENU>(IDOK), nullptr, nullptr);
-            const auto font = reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT));
-            SendMessageW(button_, WM_SETFONT, font, TRUE);
-            SendMessageW(cancel_, WM_SETFONT, font, TRUE);
-            return 0;
-        }
-        case WM_SIZE: {
-            RECT client{};
-            GetClientRect(window_, &client);
-            const auto dpi = find_dpi(window_);
-            const int header = px(36, dpi), footer = px(50, dpi), margin = px(12, dpi);
-            const int width = std::max(1L, client.right - 2 * margin);
-            const int height = std::max(1L, client.bottom - header - footer);
-            const double scale = std::min(static_cast<double>(width) / pixels_.cols,
-                                          static_cast<double>(height) / pixels_.rows);
-            const LONG w = std::max(1L, std::lround(scale * pixels_.cols));
-            const LONG h = std::max(1L, std::lround(scale * pixels_.rows));
-            image_ = {(client.right - w) / 2, (height - h) / 2 + header,
-                      (client.right - w) / 2 + w, (height - h) / 2 + header + h};
-            const int y = client.bottom - footer + px(9, dpi);
-            MoveWindow(cancel_, std::max(0L, client.right - px(212, dpi)), y,
-                       px(80, dpi), px(32, dpi), TRUE);
-            MoveWindow(button_, std::max(0L, client.right - px(122, dpi)), y,
-                       px(110, dpi), px(32, dpi), TRUE);
-            InvalidateRect(window_, nullptr, TRUE);
-            return 0;
-        }
-        case WM_LBUTTONDOWN: {
-            POINT point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-            if (PtInRect(&image_, point)) {
-                dragging_ = true;
-                anchor_ = point;
-                previous_ = selection_;
-                SetCapture(window_);
-                select(point);
-            }
-            return 0;
-        }
-        case WM_MOUSEMOVE:
-            if (dragging_) {
-                select({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
-            }
-            return 0;
-        case WM_LBUTTONUP:
-            if (dragging_) {
-                select({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)});
-                if (selection_.width < 0.01 || selection_.height < 0.01) {
-                    selection_ = previous_;
-                    InvalidateRect(window_, nullptr, FALSE);
-                }
-                dragging_ = false;
-                ReleaseCapture();
-            }
-            return 0;
-        case WM_CAPTURECHANGED:
-            if (dragging_) {
-                dragging_ = false;
-                selection_ = previous_;
-                InvalidateRect(window_, nullptr, FALSE);
-            }
-            return 0;
-        case DM_GETDEFID:
-            return MAKELRESULT(IDOK, DC_HASDEFID);
-        case WM_COMMAND:
-            if (LOWORD(wparam) == IDOK && selection_.width >= 0.01 && selection_.height >= 0.01) {
-                accepted_ = true;
-                DestroyWindow(window_);
-            } else if (LOWORD(wparam) == IDCANCEL) {
-                DestroyWindow(window_);
-            }
-            return 0;
-        case WM_PAINT:
-            paint();
-            return 0;
-        case WM_NCDESTROY: {
-            const auto window = window_;
-            window_ = nullptr;
-            return DefWindowProcW(window, message, wparam, lparam);
-        }
-        }
-        return DefWindowProcW(window_, message, wparam, lparam);
-    }
-
-    void select(POINT point) {
-        point.x = std::clamp(point.x, image_.left, image_.right);
-        point.y = std::clamp(point.y, image_.top, image_.bottom);
-        const auto w = static_cast<double>(image_.right - image_.left);
-        const auto h = static_cast<double>(image_.bottom - image_.top);
-        selection_ = {(std::min(point.x, anchor_.x) - image_.left) / w,
-                      (std::min(point.y, anchor_.y) - image_.top) / h,
-                      std::abs(point.x - anchor_.x) / w, std::abs(point.y - anchor_.y) / h};
-        InvalidateRect(window_, &image_, FALSE);
-    }
-
-    void paint() {
-        PAINTSTRUCT paint{};
-        const HDC dc = BeginPaint(window_, &paint);
-        const LONG width = image_.right - image_.left, height = image_.bottom - image_.top;
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(info.bmiHeader);
-        info.bmiHeader.biWidth = pixels_.cols;
-        info.bmiHeader.biHeight = -pixels_.rows;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-        SetStretchBltMode(dc, HALFTONE);
-        StretchDIBits(dc, image_.left, image_.top, width, height, 0, 0, pixels_.cols, pixels_.rows,
-                      pixels_.data, &info, DIB_RGB_COLORS, SRCCOPY);
-        const auto pen = CreatePen(PS_SOLID, 2, RGB(92, 245, 255));
-        const auto previous_pen = SelectObject(dc, pen);
-        const auto previous_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, image_.left + std::lround(width * selection_.x),
-                  image_.top + std::lround(height * selection_.y),
-                  image_.left + std::lround(width * (selection_.x + selection_.width)),
-                  image_.top + std::lround(height * (selection_.y + selection_.height)));
-        SelectObject(dc, previous_brush);
-        SelectObject(dc, previous_pen);
-        DeleteObject(pen);
-        RECT client{};
-        GetClientRect(window_, &client);
-        client.left += px(12, find_dpi(window_));
-        client.bottom = px(36, find_dpi(window_));
-        draw_text(dc, L"沿视频边缘拖动选框，框住完整的攻略画面。", client,
-            static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)), GetSysColor(COLOR_WINDOWTEXT),
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        EndPaint(window_, &paint);
-    }
-
-    HWND window_{}, button_{}, cancel_{};
-    cv::Mat pixels_;
-    NormalizedRect selection_, previous_;
-    RECT image_{};
-    POINT anchor_{};
-    bool dragging_ = false, accepted_ = false;
-};
-
 struct FieldError {
     int id;
     std::wstring message;
@@ -461,7 +261,7 @@ private:
         Page page;
         Font font;
         ControlKind kind;
-        bool windows_only;
+        Visibility visibility;
     };
 
     HFONT font(Font role) const {
@@ -513,6 +313,12 @@ private:
                 command(LOWORD(wparam));
             } else if (LOWORD(wparam) == edge_mode && HIWORD(wparam) == CBN_SELCHANGE) {
                 update_mode();
+            } else if (LOWORD(wparam) == debug_mode && HIWORD(wparam) == CBN_SELCHANGE) {
+                refresh_visibility();
+            } else if (LOWORD(wparam) == capture_window && HIWORD(wparam) == CBN_DROPDOWN) {
+                populate_capture_windows();
+            } else if (LOWORD(wparam) == capture_window && HIWORD(wparam) == CBN_SELCHANGE) {
+                choose_capture_window();
             } else if (HIWORD(wparam) == EN_CHANGE) {
                 const int id = LOWORD(wparam);
                 if (id == video_fps || id == player_fps) {
@@ -577,11 +383,8 @@ private:
         }
         case WM_CLOSE:
             KillTimer(window_, 1);
-            if (preview_stop_) {
-                SetEvent(preview_stop_.get());
-            }
+            cancel_preview();
             hud_.close();
-            preview_.reset();
             DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
@@ -595,23 +398,23 @@ private:
     HWND item(int id) const { return GetDlgItem(window_, id); }
 
     HWND add(Page page, const wchar_t* window_class, const wchar_t* label, DWORD style, int id, Layout bounds,
-             Font face = Font::body, ControlKind kind = ControlKind::plain, bool windows_only = false) {
+             Font face = Font::body, ControlKind kind = ControlKind::plain, Visibility visibility = Visibility::always) {
         const auto control = CreateWindowExW(0, window_class, label, WS_CHILD | style, 0, 0, 0, 0,
             window_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), instance_, nullptr);
         if (!control) {
             throw std::runtime_error("cannot create control");
         }
-        elements_.push_back({control, bounds, page, face, kind, windows_only});
+        elements_.push_back({control, bounds, page, face, kind, visibility});
         return control;
     }
 
     void label(Page page, const wchar_t* text, Layout bounds, Font face = Font::body, int id = 0,
-               bool windows_only = false) {
-        add(page, L"STATIC", text, SS_CENTERIMAGE | SS_NOPREFIX, id, bounds, face, ControlKind::plain, windows_only);
+               Visibility visibility = Visibility::always) {
+        add(page, L"STATIC", text, SS_CENTERIMAGE | SS_NOPREFIX, id, bounds, face, ControlKind::plain, visibility);
     }
 
-    void edit(Page page, int id, Layout bounds, bool windows_only = false) {
-        add(page, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, id, bounds, Font::body, ControlKind::edit, windows_only);
+    void edit(Page page, int id, Layout bounds, Visibility visibility = Visibility::always) {
+        add(page, L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, id, bounds, Font::body, ControlKind::edit, visibility);
     }
 
     void field(Page page, const wchar_t* text, int id, int x, int y, int width) {
@@ -619,9 +422,9 @@ private:
         edit(page, id, {x, y + 26, width, 34});
     }
 
-    void button(Page page, const wchar_t* name, int id, Layout bounds, bool windows_only = false) {
+    void button(Page page, const wchar_t* name, int id, Layout bounds, Visibility visibility = Visibility::always) {
         const auto control = add(page, L"BUTTON", name,
-            BS_OWNERDRAW | WS_TABSTOP, id, bounds, Font::body, ControlKind::button, windows_only);
+            BS_OWNERDRAW | WS_TABSTOP, id, bounds, Font::body, ControlKind::button, visibility);
         SetWindowSubclass(control, button_proc, 1, reinterpret_cast<DWORD_PTR>(this));
     }
 
@@ -629,9 +432,10 @@ private:
         add(page, L"BUTTON", name, BS_AUTOCHECKBOX | WS_TABSTOP, id, bounds);
     }
 
-    void combo(Page page, int id, Layout bounds, std::initializer_list<const wchar_t*> entries) {
+    void combo(Page page, int id, Layout bounds, std::initializer_list<const wchar_t*> entries,
+               Visibility visibility = Visibility::always) {
         const HWND box = add(page, WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL,
-            id, bounds, Font::body, ControlKind::combo);
+            id, bounds, Font::body, ControlKind::combo, visibility);
         for (const auto* entry : entries) {
             SendMessageW(box, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(entry));
         }
@@ -683,28 +487,47 @@ private:
         label(page, L"Edge 取帧模式", {56, 165, 350, 24}, Font::section);
         combo(page, edge_mode, {56, 195, 440, 136},
               {L"远程模式 · 支持最小化", L"唤醒模式 · Edge 窗口需还原", L"Windows 捕获 · 无需 Edge 调试"});
+        constexpr auto wgc = Visibility::window_capture;
+        label(page, L"捕获窗口", {516, 165, 196, 24}, Font::section, 0, wgc);
+        combo(page, capture_window, {516, 195, 196, 284}, {}, wgc);
         label(page, L"", {56, 231, 656, 22}, Font::note, edge_help);
         label(page, L"", {56, 264, 656, 22}, Font::body, filter_label);
         edit(page, edge_filter, {56, 289, 656, 34});
 
         label(page, L"固定小地图", {56, 348, 168, 24}, Font::section);
-        label(page, L"按 640 × 360 视频坐标", {232, 349, 308, 22}, Font::note);
+        label(page, L"", {232, 349, 480, 22}, Font::note, minimap_help);
         field(page, L"圆心 X", circle_x, 56, 377, 148);
         field(page, L"圆心 Y", circle_y, 224, 377, 148);
         field(page, L"半径", circle_r, 392, 377, 148);
         field(page, L"取帧内缩", inset, 560, 377, 152);
 
-        label(page, L"视频范围", {56, 443, 100, 18}, Font::note, 0, true);
-        label(page, L"", {56, 464, 100, 30}, Font::body, video_rect_status, true);
+        label(page, L"取帧区域", {56, 443, 92, 18}, Font::note, 0, wgc);
+        label(page, L"", {56, 464, 96, 30}, Font::body, video_rect_status, wgc);
         const std::array ids{video_x, video_y, video_w, video_h};
         const std::array names{L"左", L"上", L"宽", L"高"};
         for (int i = 0; i < 4; ++i) {
-            const int x = 164 + 71 * i;
-            label(page, names[i], {x, 443, 60, 18}, Font::note, 0, true);
-            edit(page, ids[i], {x, 464, 60, 30}, true);
+            const int x = 156 + 62 * i;
+            label(page, names[i], {x, 443, 52, 18}, Font::note, 0, Visibility::window_video);
+            edit(page, ids[i], {x, 464, 52, 30}, Visibility::window_video);
         }
-        button(page, L"框选视频…", select_video, {460, 464, 126, 30}, true);
-        button(page, L"全屏用整窗", reset_video, {598, 464, 114, 30}, true);
+        button(page, L"框选视频…", select_video, {410, 464, 104, 30}, wgc);
+        button(page, L"圈选小地图…", select_minimap, {522, 464, 114, 30}, wgc);
+        button(page, L"整窗", reset_video, {644, 464, 68, 30}, wgc);
+
+        label(page, L"调试连接", {56, 451, 192, 20}, Font::note, 0, Visibility::debug);
+        combo(page, debug_mode, {56, 474, 192, 120}, {L"自动查找", L"手动目录", L"手动端口"}, Visibility::debug);
+        label(page, L"从 Edge 正式版的默认用户数据目录读取。", {272, 473, 440, 30},
+              Font::note, 0, Visibility::auto_debug);
+
+        constexpr auto directory = Visibility::manual_directory;
+        label(page, L"包含 DevToolsActivePort 的目录", {272, 451, 440, 20}, Font::note, 0, directory);
+        edit(page, debug_directory, {272, 473, 340, 30}, directory);
+        button(page, L"浏览…", debug_browse, {624, 473, 88, 30}, directory);
+
+        constexpr auto port = Visibility::manual_port;
+        label(page, L"本地调试端口（1–65535）", {272, 451, 400, 20}, Font::note, 0, port);
+        edit(page, debug_port, {272, 473, 148, 30}, port);
+        label(page, L"若 Edge 弹出授权，请点允许。", {436, 473, 276, 30}, Font::note, 0, port);
     }
 
     void advanced_controls() {
@@ -724,10 +547,18 @@ private:
     }
 
     void write_form(const GuideSettings& settings) {
+        cancel_preview();
+        capture_target_ = settings.capture_window;
+        draft_minimap_ = settings.window_minimap;
+        populate_capture_windows();
         SetDlgItemTextW(window_, assets, settings.assets.c_str());
         SetDlgItemTextW(window_, game_title, settings.game_title.c_str());
         SetDlgItemTextW(window_, edge_filter, settings.edge_pattern.c_str());
         SendDlgItemMessageW(window_, edge_mode, CB_SETCURSEL, static_cast<int>(settings.capture_mode), 0);
+        SendDlgItemMessageW(window_, debug_mode, CB_SETCURSEL, static_cast<int>(settings.edge_endpoint), 0);
+        SetDlgItemTextW(window_, debug_directory, settings.edge_debug_directory.c_str());
+        const auto port = settings.edge_debug_port ? std::to_wstring(settings.edge_debug_port) : L"";
+        SetDlgItemTextW(window_, debug_port, port.c_str());
         SendDlgItemMessageW(window_, method, CB_SETCURSEL, static_cast<int>(settings.method), 0);
         write_number(circle_x, settings.circle.x);
         write_number(circle_y, settings.circle.y);
@@ -770,6 +601,7 @@ private:
                        bounds.bottom - bounds.top, FALSE);
         }
         TabCtrl_SetItemSize(item(settings_tabs), px(151, dpi_), px(36, dpi_));
+        SendDlgItemMessageW(window_, capture_window, CB_SETDROPPEDWIDTH, px(550, dpi_), 0);
         for (auto old : old_fonts) {
             if (old) {
                 DeleteObject(old);
@@ -811,15 +643,31 @@ private:
         return found == elements_.end() ? nullptr : &*found;
     }
 
-    bool is_visible(const Element& element, bool window_capture) const {
-        return (element.page == Page::shared || element.page == active_page_)
-            && (!element.windows_only || window_capture);
+    Visibility active_edge_controls() const {
+        if (uses_window_capture()) {
+            return Visibility::window_capture;
+        }
+        switch (debug_choice()) {
+        case EdgeEndpointMode::directory: return Visibility::manual_directory;
+        case EdgeEndpointMode::port: return Visibility::manual_port;
+        default: return Visibility::auto_debug;
+        }
+    }
+
+    bool is_visible(const Element& element, Visibility edge_controls) const {
+        if (element.page != Page::shared && element.page != active_page_) {
+            return false;
+        }
+        return element.visibility == Visibility::always || element.visibility == edge_controls
+            || (element.visibility == Visibility::window_video && edge_controls == Visibility::window_capture
+                && !draft_minimap_)
+            || (element.visibility == Visibility::debug && edge_controls != Visibility::window_capture);
     }
 
     void refresh_visibility() {
-        const bool window_capture = uses_window_capture();
+        const auto edge_controls = active_edge_controls();
         for (const auto& element : elements_) {
-            ShowWindow(element.window, is_visible(element, window_capture) ? SW_SHOWNA : SW_HIDE);
+            ShowWindow(element.window, is_visible(element, edge_controls) ? SW_SHOWNA : SW_HIDE);
         }
         RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
@@ -844,10 +692,10 @@ private:
     }
 
     void focus_at(POINT point) {
-        const bool window_capture = uses_window_capture();
+        const auto edge_controls = active_edge_controls();
         for (const auto& element : elements_) {
             const auto bounds = element.bounds.scaled(dpi_);
-            if (element.kind == ControlKind::edit && is_visible(element, window_capture) && PtInRect(&bounds, point)) {
+            if (element.kind == ControlKind::edit && is_visible(element, edge_controls) && PtInRect(&bounds, point)) {
                 SetFocus(element.window);
                 break;
             }
@@ -889,6 +737,9 @@ private:
             break;
         case Page::edge:
             line(338);
+            if (!uses_window_capture()) {
+                line(444);
+            }
             break;
         case Page::advanced:
             line(320);
@@ -896,10 +747,10 @@ private:
         default:
             break;
         }
-        const bool window_capture = uses_window_capture();
+        const auto edge_controls = active_edge_controls();
         const auto focus = GetFocus();
         for (const auto& element : elements_) {
-            if (element.kind == ControlKind::edit && is_visible(element, window_capture)) {
+            if (element.kind == ControlKind::edit && is_visible(element, edge_controls)) {
                 box(element.bounds, 10, colors_.surface, focus == element.window ? colors_.accent : colors_.input_border);
             }
         }
@@ -1039,24 +890,83 @@ private:
             static_cast<int>(guide::CaptureMode::windows);
     }
 
+    EdgeEndpointMode debug_choice() const {
+        return static_cast<EdgeEndpointMode>(SendDlgItemMessageW(window_, debug_mode, CB_GETCURSEL, 0, 0));
+    }
+
+    void populate_capture_windows() {
+        const auto list = item(capture_window);
+        capture_options_ = guide::available_capture_windows();
+        int selected = 0;
+        bool remembered = false;
+        if (capture_target_) {
+            const auto match = std::find_if(capture_options_.begin(), capture_options_.end(), [this](const auto& window) {
+                return window.handle == capture_target_->handle && window.process_id == capture_target_->process_id;
+            });
+            if (match == capture_options_.end()) {
+                capture_options_.push_back(*capture_target_);
+                selected = static_cast<int>(capture_options_.size());
+                remembered = true;
+            } else {
+                selected = static_cast<int>(std::distance(capture_options_.begin(), match)) + 1;
+            }
+        }
+        SendMessageW(list, CB_RESETCONTENT, 0, 0);
+        SendMessageW(list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"自动匹配 Edge"));
+        for (std::size_t i = 0; i < capture_options_.size(); ++i) {
+            const auto& target = capture_options_[i];
+            auto text = target.title + L"  ·  " + std::filesystem::path(target.executable).filename().wstring();
+            if (remembered && i + 1 == capture_options_.size()) text += L"（上次选择）";
+            SendMessageW(list, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+        }
+        SendMessageW(list, CB_SETCURSEL, selected, 0);
+    }
+
+    void choose_capture_window() {
+        const auto choice = SendDlgItemMessageW(window_, capture_window, CB_GETCURSEL, 0, 0);
+        if (choice < 0 || static_cast<std::size_t>(choice) > capture_options_.size()) return;
+        const auto previous_handle = capture_target_ ? capture_target_->handle : 0;
+        const auto previous_process = capture_target_ ? capture_target_->process_id : 0;
+        capture_target_ = choice ? std::optional(capture_options_[choice - 1]) : std::nullopt;
+        if (previous_handle != (capture_target_ ? capture_target_->handle : 0)
+            || previous_process != (capture_target_ ? capture_target_->process_id : 0)) {
+            cancel_preview();
+            draft_minimap_.reset();
+            set_status(L"捕获窗口已切换，可以重新框选视频或圈选小地图。");
+        }
+        update_mode();
+    }
+
+    void cancel_preview() {
+        if (preview_stop_) SetEvent(preview_stop_.get());
+        preview_request_.reset();
+        preview_.reset();
+    }
+
     void update_mode() {
         const auto mode = SendDlgItemMessageW(window_, edge_mode, CB_GETCURSEL, 0, 0);
         const bool windows = uses_window_capture();
         if (!windows) {
-            if (preview_stop_) {
-                SetEvent(preview_stop_.get());
-            }
-            preview_.reset();
+            cancel_preview();
         }
         if (mode >= 0 && mode <= 2) {
             const std::array hints{
                 L"复用当前 Edge。允许本地调试后，最小化仍可读取攻略视频。",
                 L"需要本地调试授权。保持 Edge 还原，并让小地图留在可见区域。",
-                L"保持攻略在已还原的 Edge 中播放。普通网页先框选视频画面。"};
+                L"选择一个已还原的窗口，然后框选视频画面或直接圈选小地图。"};
             SetDlgItemTextW(window_, edge_help, hints[mode]);
         }
-        SetDlgItemTextW(window_, filter_label, windows ? L"攻略窗口标题（正则）" : L"攻略标签筛选（正则）");
-        EnableWindow(item(select_video), windows && !preview_frame_.valid() && !preview_);
+        SetDlgItemTextW(window_, filter_label, windows ? L"自动匹配 Edge 的窗口标题（正则）" : L"攻略标签筛选（正则）");
+        EnableWindow(item(edge_filter), !windows || !capture_target_);
+        const bool ready = windows && !preview_frame_.valid() && !preview_;
+        EnableWindow(item(select_video), ready);
+        EnableWindow(item(select_minimap), ready);
+        const bool direct = windows && draft_minimap_.has_value();
+        SetDlgItemTextW(window_, minimap_help, direct
+            ? L"正使用圈选区域，可在预览中调整内缩。" : L"按 640 × 360 视频坐标");
+        for (const int id : {circle_x, circle_y, circle_r, inset}) {
+            EnableWindow(item(id), !direct);
+        }
         if (windows) {
             update_video_rect();
         }
@@ -1076,6 +986,10 @@ private:
 
     void update_video_rect() {
         if (!uses_window_capture()) {
+            return;
+        }
+        if (draft_minimap_) {
+            SetDlgItemTextW(window_, video_rect_status, L"已圈选小地图");
             return;
         }
         const wchar_t* text = L"范围无效";
@@ -1133,23 +1047,40 @@ private:
         if (settings.game_title.empty()) {
             throw FieldError{game_title, L"请填写游戏窗口名称。"};
         }
-        settings.edge_pattern = read_filter();
         settings.capture_mode = static_cast<guide::CaptureMode>(SendMessageW(item(edge_mode), CB_GETCURSEL, 0, 0));
+        settings.capture_window = capture_target_;
+        settings.window_minimap = draft_minimap_;
+        const bool windows = settings.capture_mode == guide::CaptureMode::windows;
+        settings.edge_pattern = windows && capture_target_ ? text_of(item(edge_filter)) : read_filter();
+        settings.edge_endpoint = debug_choice();
+        settings.edge_debug_directory = text_of(item(debug_directory));
+        settings.edge_debug_port = guide::parse_edge_debug_port(text_of(item(debug_port))).value_or(0);
+        if (!windows) {
+            if (settings.edge_endpoint == EdgeEndpointMode::directory &&
+                guide::expand_edge_debug_directory(settings.edge_debug_directory).empty()) {
+                throw FieldError{debug_directory, L"请填写包含 DevToolsActivePort 的完整目录路径。"};
+            }
+            if (settings.edge_endpoint == EdgeEndpointMode::port && !settings.edge_debug_port) {
+                throw FieldError{debug_port, L"调试端口须填写 1–65535 的整数。"};
+            }
+        }
         try {
             settings.video_rect = read_rect();
         } catch (const FieldError&) {
-            if (settings.capture_mode == guide::CaptureMode::windows) {
+            if (windows && !settings.window_minimap) {
                 throw;
             }
         }
-        settings.circle.x = number(circle_x, 0, 639, L"圆心 X");
-        settings.circle.y = number(circle_y, 0, 359, L"圆心 Y");
-        settings.circle.radius = number(circle_r, 1, 320, L"半径");
-        settings.inset = number(inset, 0, 319, L"取帧内缩");
-        const double half = settings.circle.radius - settings.inset;
-        const double x = settings.circle.x, y = settings.circle.y;
-        if (half < 1 || half >= std::min({x, y, 640 - x, 360 - y})) {
-            throw FieldError{inset, L"内缩后的小地图范围须落在 640 × 360 视频坐标内。"};
+        if (!windows || !settings.window_minimap) {
+            settings.circle.x = number(circle_x, 0, 639, L"圆心 X");
+            settings.circle.y = number(circle_y, 0, 359, L"圆心 Y");
+            settings.circle.radius = number(circle_r, 1, 320, L"半径");
+            settings.inset = number(inset, 0, 319, L"取帧内缩");
+            const double half = settings.circle.radius - settings.inset;
+            const double x = settings.circle.x, y = settings.circle.y;
+            if (half < 1 || half >= std::min({x, y, 640 - x, 360 - y})) {
+                throw FieldError{inset, L"内缩后的小地图范围须落在 640 × 360 视频坐标内。"};
+            }
         }
         settings.video_fps = number(video_fps, guide::min_capture_fps, guide::max_capture_fps, L"攻略帧率");
         settings.player_fps = number(player_fps, guide::min_capture_fps, guide::max_capture_fps, L"玩家帧率");
@@ -1174,16 +1105,16 @@ private:
         return filter;
     }
 
-    void choose_assets() {
+    void choose_directory(int id, const wchar_t* title) {
         ComPtr<IFileOpenDialog> dialog;
         if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) {
             set_status(L"无法打开目录选择窗口。", Status::error);
             return;
         }
         dialog->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
-        dialog->SetTitle(L"选择 BetterGI 的 Assets/Map/Teyvat 目录");
+        dialog->SetTitle(title);
         ComPtr<IShellItem> current;
-        const auto current_path = text_of(item(assets));
+        const auto current_path = text_of(item(id));
         if (!current_path.empty() && SUCCEEDED(SHCreateItemFromParsingName(
             current_path.c_str(), nullptr, IID_PPV_ARGS(&current)))) {
             dialog->SetFolder(current.Get());
@@ -1192,9 +1123,27 @@ private:
         PWSTR path{};
         if (SUCCEEDED(dialog->Show(window_)) && SUCCEEDED(dialog->GetResult(&result))
             && SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-            SetDlgItemTextW(window_, assets, path);
+            SetDlgItemTextW(window_, id, path);
             CoTaskMemFree(path);
         }
+    }
+
+    void start_preview(CalibrationKind kind) {
+        if (!uses_window_capture() || preview_frame_.valid() || preview_) return;
+        GuideSettings settings = settings_;
+        settings.capture_window = capture_target_;
+        if (!capture_target_) settings.edge_pattern = read_filter();
+        preview_stop_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        if (!preview_stop_) {
+            set_status(L"无法启动窗口预览。", Status::error);
+            return;
+        }
+        set_status(L"正在获取选定窗口的截图，请保持窗口还原。");
+        preview_request_ = kind;
+        preview_frame_ = std::async(std::launch::async, [settings = std::move(settings), event = preview_stop_.get()] {
+            return guide::preview_capture_window(settings, 1400, event);
+        });
+        update_mode();
     }
 
     void command(int id) {
@@ -1209,30 +1158,23 @@ private:
             break;
         }
         case browse:
-            choose_assets();
+            choose_directory(assets, L"选择 BetterGI 的 Assets/Map/Teyvat 目录");
+            break;
+        case debug_browse:
+            choose_directory(debug_directory, L"选择包含 DevToolsActivePort 的 Edge 用户数据目录");
             break;
         case reset_video:
+            draft_minimap_.reset();
             write_rect({});
             set_status(L"视频范围已设为整窗。");
-            break;
-        case select_video: {
-            if (!uses_window_capture() || preview_frame_.valid() || preview_) {
-                break;
-            }
-            GuideSettings settings = settings_;
-            settings.edge_pattern = read_filter();
-            preview_stop_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-            if (!preview_stop_) {
-                set_status(L"无法启动窗口预览。", Status::error);
-                break;
-            }
-            set_status(L"正在获取 Edge 窗口预览，请保持窗口还原。");
-            preview_frame_ = std::async(std::launch::async, [settings = std::move(settings), event = preview_stop_.get()] {
-                return guide::preview_edge(settings, 1400, event);
-            });
             update_mode();
             break;
-        }
+        case select_video:
+            start_preview(CalibrationKind::video);
+            break;
+        case select_minimap:
+            start_preview(CalibrationKind::minimap);
+            break;
         case stop:
             hud_.close();
             EnableWindow(item(stop), FALSE);
@@ -1268,9 +1210,17 @@ private:
             set_status(L"HUD 已退出，请检查运行库或地图目录后重试。", Status::error);
         }
         if (preview_ && !preview_->open()) {
-            if (const auto rect = preview_->result()) {
-                write_rect(*rect);
-                set_status(L"已选定视频区域。");
+            if (const auto& selection = preview_->result()) {
+                if (preview_->kind() == CalibrationKind::minimap) {
+                    draft_minimap_ = *selection;
+                    set_status(L"已圈选小地图，可仅保存或应用并启动 HUD。");
+                } else {
+                    draft_minimap_.reset();
+                    write_rect(selection->bounds);
+                    set_status(L"已框选视频画面，可仅保存或应用并启动 HUD。");
+                }
+            } else {
+                set_status(L"已取消选区。");
             }
             preview_.reset();
             update_mode();
@@ -1279,17 +1229,21 @@ private:
             preview_frame_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
             auto frame = preview_frame_.get();
             preview_stop_.reset();
-            if (!uses_window_capture()) {
-                set_status(L"取帧模式已切换。");
-            } else if (frame.image.empty()) {
-                set_status(frame.status, Status::error);
-            } else {
-                NormalizedRect rect;
-                try {
-                    rect = read_rect();
-                } catch (const FieldError&) {}
-                preview_ = std::make_unique<Preview>(instance_, window_, frame.image, rect);
-                set_status(L"请在预览中框住攻略视频。");
+            const auto kind = preview_request_;
+            preview_request_.reset();
+            if (kind && uses_window_capture()) {
+                if (frame.image.empty()) {
+                    set_status(frame.status, Status::error);
+                } else {
+                    NormalizedRect rect;
+                    try {
+                        rect = read_rect();
+                    } catch (const FieldError&) {}
+                    preview_ = std::make_unique<guide::CapturePreview>(
+                        instance_, window_, frame.image, *kind, rect, draft_minimap_);
+                    set_status(*kind == CalibrationKind::minimap ? L"滚轮放大，在预览中从圆心拖到小地图边缘。"
+                                                                 : L"请在预览中框住攻略视频。");
+                }
             }
             update_mode();
         }
@@ -1306,10 +1260,14 @@ private:
     Palette colors_ = Palette::system();
     std::array<HFONT, static_cast<std::size_t>(Font::count)> fonts_{};
     std::vector<Element> elements_;
+    std::vector<guide::CaptureWindow> capture_options_;
+    std::optional<guide::CaptureWindow> capture_target_;
+    std::optional<guide::WindowMinimap> draft_minimap_;
     HudProcess hud_;
     Handle preview_stop_;
     std::future<guide::VideoFrame> preview_frame_;
-    std::unique_ptr<Preview> preview_;
+    std::optional<CalibrationKind> preview_request_;
+    std::unique_ptr<guide::CapturePreview> preview_;
 };
 
 }

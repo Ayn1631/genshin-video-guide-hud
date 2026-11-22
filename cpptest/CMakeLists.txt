@@ -41,7 +41,7 @@ if(WIN32 AND MSVC)
     target_link_libraries(bgi_window_capture PRIVATE d3d11 windowsapp)
 
     add_executable(GenshinVideoGuideHUD WIN32
-        native_app.cpp native_settings.cpp native_pipeline.cpp
+        native_app.cpp native_calibration.cpp native_settings.cpp native_pipeline.cpp
         native_game.cpp native_video.cpp native_hud.cpp)
     target_compile_features(GenshinVideoGuideHUD PRIVATE cxx_std_17)
     target_compile_definitions(GenshinVideoGuideHUD PRIVATE

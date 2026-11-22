@@ -7,6 +7,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <winhttp.h>
 #include <combaseapi.h>
+#include <dwmapi.h>
 #include <wincrypt.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -64,6 +65,13 @@ bool valid_circle(const GuideSettings& settings) {
 }
 
 NormalizedRect minimap_region(const GuideSettings& settings) {
+    if (settings.window_minimap) {
+        const auto& map = *settings.window_minimap;
+        const auto& bounds = map.bounds;
+        const double margin = map.inset_fraction / 2, scale = 1 - map.inset_fraction;
+        return {bounds.x + bounds.width * margin, bounds.y + bounds.height * margin,
+                bounds.width * scale, bounds.height * scale};
+    }
     const auto& r = settings.video_rect;
     const auto& c = settings.circle;
     const double half = c.radius - settings.inset;
@@ -71,62 +79,109 @@ NormalizedRect minimap_region(const GuideSettings& settings) {
         r.width * 2 * half / 640, r.height * 2 * half / 360};
 }
 
-struct EdgeWindow {
-    HWND hwnd;
-    std::wstring title;
-    long long area;
-};
-
-BOOL CALLBACK collect_edge(HWND hwnd, LPARAM param) {
-    if (!IsWindowVisible(hwnd)) return TRUE;
+std::optional<CaptureWindow> describe_window(HWND hwnd, bool edge_only) {
+    if (!IsWindowVisible(hwnd)) return std::nullopt;
     wchar_t class_name[128]{};
-    GetClassNameW(hwnd, class_name, 128);
-    if (wcscmp(class_name, L"Chrome_WidgetWin_1") != 0) return TRUE;
+    if (!GetClassNameW(hwnd, class_name, ARRAYSIZE(class_name))
+        || (edge_only && wcscmp(class_name, L"Chrome_WidgetWin_1") != 0)) {
+        return std::nullopt;
+    }
+    if (!edge_only) {
+        DWORD cloaked = 0;
+        if (hwnd == GetShellWindow() || hwnd == GetDesktopWindow()
+            || (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+            || (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)) {
+            return std::nullopt;
+        }
+    }
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return std::nullopt;
+    std::wstring title(static_cast<size_t>(GetWindowTextLengthW(hwnd)) + 1, L'\0');
+    title.resize(GetWindowTextW(hwnd, title.data(), static_cast<int>(title.size())));
+    if (title.empty()) return std::nullopt;
+
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!process) return TRUE;
+    if (!process) return std::nullopt;
     wchar_t executable[32768];
     DWORD length = ARRAYSIZE(executable);
     const bool found = QueryFullProcessImageNameW(process, 0, executable, &length) != FALSE;
     CloseHandle(process);
-    if (!found) return TRUE;
+    if (!found) return std::nullopt;
     const wchar_t* last = wcsrchr(executable, L'\\');
-    if (_wcsicmp(last ? last + 1 : executable, L"msedge.exe") != 0) return TRUE;
-    std::wstring title(static_cast<size_t>(GetWindowTextLengthW(hwnd)) + 1, L'\0');
-    title.resize(GetWindowTextW(hwnd, title.data(), static_cast<int>(title.size())));
-    if (title.empty()) return TRUE;
-    RECT r{};
-    GetWindowRect(hwnd, &r);
-    reinterpret_cast<std::vector<EdgeWindow>*>(param)->push_back(
-        {hwnd, std::move(title), static_cast<long long>(r.right - r.left) * (r.bottom - r.top)});
+    if (edge_only && _wcsicmp(last ? last + 1 : executable, L"msedge.exe") != 0) return std::nullopt;
+    std::replace_if(title.begin(), title.end(), [](wchar_t c) { return c == L'\r' || c == L'\n'; }, L' ');
+    std::wstring kind(class_name);
+    std::replace_if(kind.begin(), kind.end(), [](wchar_t c) { return c == L'\r' || c == L'\n'; }, L' ');
+    return CaptureWindow{reinterpret_cast<std::uintptr_t>(hwnd), pid, std::wstring(executable, length),
+                         std::move(kind), std::move(title)};
+}
+
+struct WindowList {
+    bool edge_only;
+    std::vector<CaptureWindow> entries;
+};
+
+BOOL CALLBACK collect_windows(HWND hwnd, LPARAM param) {
+    auto& list = *reinterpret_cast<WindowList*>(param);
+    if (auto target = describe_window(hwnd, list.edge_only)) {
+        list.entries.push_back(std::move(*target));
+    }
     return TRUE;
+}
+
+std::vector<CaptureWindow> window_list(bool edge_only) {
+    WindowList list{edge_only, {}};
+    EnumWindows(collect_windows, reinterpret_cast<LPARAM>(&list));
+    return std::move(list.entries);
+}
+
+bool same_window_type(const CaptureWindow& left, const CaptureWindow& right) {
+    return _wcsicmp(left.executable.c_str(), right.executable.c_str()) == 0 && left.window_class == right.window_class;
+}
+
+HWND find_selected_window(const CaptureWindow& target) {
+    auto hwnd = reinterpret_cast<HWND>(target.handle);
+    if (const auto current = describe_window(hwnd, false);
+        current && current->process_id == target.process_id && same_window_type(*current, target)) {
+        return hwnd;
+    }
+    HWND match = nullptr;
+    for (const auto& candidate : window_list(false)) {
+        if (same_window_type(candidate, target) && candidate.title == target.title) {
+            if (match) return nullptr;
+            match = reinterpret_cast<HWND>(candidate.handle);
+        }
+    }
+    return match;
 }
 
 HWND find_window(const std::wstring& pattern) {
     const bool use_default = pattern.empty() || pattern == LR"(bilibili\.com)";
     const std::wregex filter(use_default ? L"bilibili|哔哩哔哩|B站" : pattern, std::regex::icase);
-    std::vector<EdgeWindow> windows;
-    EnumWindows(collect_edge, reinterpret_cast<LPARAM>(&windows));
     const HWND foreground = GetForegroundWindow();
-    const EdgeWindow* best = nullptr;
-    const auto rank = [foreground](const EdgeWindow& w) {
-        return std::make_tuple(!IsIconic(w.hwnd), w.hwnd == foreground, w.area);
+    HWND best = nullptr;
+    const auto rank = [foreground](HWND hwnd) {
+        RECT bounds{};
+        GetWindowRect(hwnd, &bounds);
+        const auto area = static_cast<long long>(bounds.right - bounds.left) * (bounds.bottom - bounds.top);
+        return std::make_tuple(!IsIconic(hwnd), hwnd == foreground, area);
     };
     HWND only_main = nullptr;
     unsigned main_count = 0;
-    for (const auto& w : windows) {
-        if (std::regex_search(w.title, filter) && (!best || rank(w) > rank(*best))) best = &w;
+    for (const auto& w : window_list(true)) {
+        const auto hwnd = reinterpret_cast<HWND>(w.handle);
+        if (std::regex_search(w.title, filter) && (!best || rank(hwnd) > rank(best))) best = hwnd;
         auto title = w.title;
         title.erase(std::remove(title.begin(), title.end(), L'\u200b'), title.end());
         constexpr std::wstring_view suffix = L" - Microsoft Edge";
         if (title.size() >= suffix.size() && _wcsicmp(title.c_str() + title.size() - suffix.size(),
                 suffix.data()) == 0) {
             ++main_count;
-            only_main = w.hwnd;
+            only_main = hwnd;
         }
     }
-    return best ? best->hwnd : (use_default && main_count == 1 ? only_main : nullptr);
+    return best ? best : (use_default && main_count == 1 ? only_main : nullptr);
 }
 
 class WindowSource {
@@ -138,14 +193,20 @@ public:
         const auto crop = bounded_video_rect(region);
         if (!crop) return waiting(L"窗口取帧区域超出画面");
         if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return waiting(L"取帧已停止");
-        if (!IsWindow(hwnd_)) {
+        DWORD current_process = 0;
+        if (hwnd_) GetWindowThreadProcessId(hwnd_, &current_process);
+        if (!current_process || current_process != process_id_) {
             close();
-            hwnd_ = find_window(settings.edge_pattern);
+            hwnd_ = settings.capture_window ? find_selected_window(*settings.capture_window)
+                                            : find_window(settings.edge_pattern);
+            process_id_ = 0;
+            if (hwnd_) GetWindowThreadProcessId(hwnd_, &process_id_);
         }
-        if (!hwnd_) return waiting(L"Windows 捕获等待匹配的 Edge 攻略窗口");
+        if (!hwnd_) return waiting(settings.capture_window
+            ? L"找不到所选捕获窗口，请在设置中重新选择" : L"Windows 捕获等待匹配的 Edge 攻略窗口");
         if (IsIconic(hwnd_)) {
             close();
-            return waiting(L"Windows 捕获等待 Edge 退出最小化");
+            return waiting(L"等待捕获窗口退出最小化");
         }
         if (!handle_) {
             keep_mta_alive();
@@ -181,6 +242,7 @@ private:
         handle_ = nullptr;
     }
     HWND hwnd_ = nullptr;
+    DWORD process_id_ = 0;
     void* handle_ = nullptr;
 };
 
@@ -205,13 +267,17 @@ void require_http(bool ok, DWORD error = 0) {
 }
 
 struct Operation {
+    const bool websocket;
     winrt::handle done{CreateEventW(nullptr, FALSE, FALSE, nullptr)};
     DWORD error = 0;
+    DWORD body_bytes = 0;
     WINHTTP_WEB_SOCKET_STATUS read{};
     std::array<char, 32768> buffer{};
     std::string outgoing;
 
-    Operation() { if (!done) winrt::throw_last_error(); }
+    explicit Operation(bool is_websocket = false) : websocket(is_websocket) {
+        if (!done) winrt::throw_last_error();
+    }
 };
 
 // Buffers live through the final callback, including cancellation in an outstanding receive.
@@ -226,7 +292,9 @@ void CALLBACK on_http(HINTERNET, DWORD_PTR context, DWORD status, void* info, DW
         op->error = static_cast<WINHTTP_ASYNC_RESULT*>(info)->dwError;
         break;
     case WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
-        if (length == sizeof(WINHTTP_WEB_SOCKET_STATUS))
+        if (!op->websocket)
+            op->body_bytes = length;
+        else if (length == sizeof(WINHTTP_WEB_SOCKET_STATUS))
             op->read = *static_cast<WINHTTP_WEB_SOCKET_STATUS*>(info);
         else op->error = ERROR_INVALID_DATA;
         break;
@@ -240,57 +308,103 @@ void CALLBACK on_http(HINTERNET, DWORD_PTR context, DWORD status, void* info, DW
     SetEvent(op->done.get());
 }
 
-std::pair<INTERNET_PORT, std::wstring> debug_endpoint() {
-    wchar_t local[32768];
-    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, ARRAYSIZE(local));
-    if (n && n < ARRAYSIZE(local)) {
-        std::ifstream in(std::filesystem::path(local) / L"Microsoft/Edge/User Data/DevToolsActivePort");
-        std::string port, path;
-        if (std::getline(in, port) && std::getline(in, path) &&
-                std::regex_match(port, std::regex("[0-9]{1,5}")) &&
-                std::regex_match(path, std::regex("/devtools/browser(/[a-zA-Z0-9_-]+)?"))) {
-            const auto number = std::stoi(port);
-            if (number > 0 && number <= 65535)
-                return {static_cast<INTERNET_PORT>(number), std::wstring(path.begin(), path.end())};
+struct DebugEndpoint {
+    INTERNET_PORT port;
+    std::wstring path;
+};
+
+std::filesystem::path edge_data_directory(const wchar_t* channel) {
+    const auto local = expand_edge_debug_directory(L"%LOCALAPPDATA%");
+    return local.empty() ? std::filesystem::path{} : local / L"Microsoft" / channel / L"User Data";
+}
+
+DebugEndpoint read_debug_file(const std::filesystem::path& source) {
+    constexpr wchar_t filename[] = L"DevToolsActivePort";
+    if (source.empty()) {
+        throw VideoError{L"请填写 Edge 调试目录的完整路径"};
+    }
+    const auto file = _wcsicmp(source.filename().c_str(), filename) == 0 ? source : source / filename;
+    std::wifstream input(file);
+    if (!input) {
+        throw VideoError{L"指定的调试目录中找不到或无法读取 DevToolsActivePort"};
+    }
+    std::wstring port_text, path;
+    const bool read = std::getline(input, port_text) && std::getline(input, path);
+    const auto port = parse_edge_debug_port(port_text);
+    static const std::wregex browser_path(L"/devtools/browser(/[a-zA-Z0-9_-]+)?");
+    if (!read || !port || !std::regex_match(path, browser_path)) {
+        throw VideoError{L"DevToolsActivePort 的端口或浏览器调试地址格式无效"};
+    }
+    return {*port, std::move(path)};
+}
+
+DebugEndpoint debug_endpoint(const GuideSettings& settings) {
+    switch (settings.edge_endpoint) {
+    case EdgeEndpointMode::directory:
+        return read_debug_file(expand_edge_debug_directory(settings.edge_debug_directory));
+    case EdgeEndpointMode::port:
+        if (!settings.edge_debug_port) {
+            throw VideoError{L"请填写 1–65535 的 Edge 本地调试端口"};
+        }
+        return {settings.edge_debug_port, {}};
+    default:
+        try {
+            return read_debug_file(edge_data_directory(L"Edge"));
+        } catch (const VideoError&) {
+            throw VideoError{L"未找到默认调试入口。请在原 Edge 开启本地调试，或选择手动目录或端口"};
         }
     }
-    throw VideoError{L"请在原 Edge 的 edge://inspect/#remote-debugging 开启并允许本地调试"};
+}
+
+std::optional<std::wstring> matching_debug_path(const GuideSettings& settings, INTERNET_PORT port) {
+    const auto lookup = [port](const std::filesystem::path& source) -> std::optional<std::wstring> {
+        try {
+            auto endpoint = read_debug_file(source);
+            if (endpoint.port == port) return std::move(endpoint.path);
+        } catch (const VideoError&) {}
+        return std::nullopt;
+    };
+    if (auto path = lookup(expand_edge_debug_directory(settings.edge_debug_directory))) {
+        return path;
+    }
+    for (const auto* channel : {L"Edge", L"Edge Beta", L"Edge Dev", L"Edge SxS"}) {
+        if (auto path = lookup(edge_data_directory(channel))) {
+            return path;
+        }
+    }
+    return std::nullopt;
 }
 
 class BrowserConnection {
 public:
-    explicit BrowserConnection(HANDLE stop) : stop_(stop) {
-        const auto endpoint = debug_endpoint();
+    BrowserConnection(const GuideSettings& settings, HANDLE stop) : stop_(stop) {
+        auto endpoint = debug_endpoint(settings);
         client_.reset(WinHttpOpen(L"GenshinVideoGuideHUD", WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC));
         require_http(bool(client_));
         const DWORD notifications = WINHTTP_CALLBACK_FLAG_HANDLES | WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS;
         require_http(WinHttpSetStatusCallback(client_.get(), on_http, notifications, 0) !=
             WINHTTP_INVALID_STATUS_CALLBACK);
-        server_.reset(WinHttpConnect(client_.get(), L"127.0.0.1", endpoint.first, 0));
+        server_.reset(WinHttpConnect(client_.get(), L"127.0.0.1", endpoint.port, 0));
         require_http(bool(server_));
-        Internet request(WinHttpOpenRequest(server_.get(), L"GET", endpoint.second.c_str(), nullptr,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0));
-        require_http(bool(request));
-        DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-        require_http(WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY,
-            &redirect_policy, sizeof(redirect_policy)) != FALSE);
+        if (endpoint.path.empty()) {
+            auto path = discover_debug_path(endpoint.port);
+            if (!path) {
+                path = matching_debug_path(settings, endpoint.port);
+            }
+            if (!path) {
+                throw VideoError{L"该端口未提供调试地址。请改用手动目录并指定包含 DevToolsActivePort 的位置"};
+            }
+            endpoint.path = std::move(*path);
+        }
+        auto request = open_get(endpoint.path.c_str());
         require_http(WinHttpSetOption(request.get(), WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) != FALSE);
-        auto context = std::make_unique<Operation>();
-        DWORD_PTR ptr = reinterpret_cast<DWORD_PTR>(context.get());
-        require_http(WinHttpSetOption(request.get(), WINHTTP_OPTION_CONTEXT_VALUE, &ptr, sizeof(ptr)) != FALSE);
-        auto* handshake = context.release(); // Released by the request's HANDLE_CLOSING callback.
         const auto deadline = Clock::now() + std::chrono::seconds(30);
-        require_http(WinHttpSendRequest(request.get(), WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            WINHTTP_NO_REQUEST_DATA, 0, 0, ptr) != FALSE);
-        wait(*handshake, deadline, L"等待原 Edge 允许本地调试连接超时");
-        require_http(WinHttpReceiveResponse(request.get(), nullptr) != FALSE);
-        wait(*handshake, deadline, L"等待原 Edge 允许本地调试连接超时");
-        DWORD status = 0, size = sizeof(status);
-        require_http(WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) != FALSE);
-        if (status != 101) throw VideoError{L"Edge 尚未允许此应用连接原浏览器"};
-        auto socket_op = std::make_unique<Operation>();
+        receive_headers(request.get(), deadline, L"等待原 Edge 允许本地调试连接超时");
+        if (status_code(request.get()) != 101) {
+            throw VideoError{L"Edge 尚未允许此应用连接原浏览器"};
+        }
+        auto socket_op = std::make_unique<Operation>(true);
         socket_.reset(WinHttpWebSocketCompleteUpgrade(request.get(), reinterpret_cast<DWORD_PTR>(socket_op.get())));
         require_http(bool(socket_));
         op_ = socket_op.release();
@@ -333,6 +447,72 @@ public:
     }
 
 private:
+    Internet open_get(const wchar_t* path) const {
+        Internet request(WinHttpOpenRequest(server_.get(), L"GET", path, nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0));
+        require_http(bool(request));
+        DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        require_http(WinHttpSetOption(request.get(), WINHTTP_OPTION_REDIRECT_POLICY,
+            &redirect_policy, sizeof(redirect_policy)) != FALSE);
+        return request;
+    }
+
+    static DWORD status_code(HINTERNET request) {
+        DWORD status = 0, size = sizeof(status);
+        require_http(WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX) != FALSE);
+        return status;
+    }
+
+    Operation& receive_headers(HINTERNET request, Clock::time_point deadline, const wchar_t* timeout) const {
+        auto context = std::make_unique<Operation>();
+        DWORD_PTR pointer = reinterpret_cast<DWORD_PTR>(context.get());
+        require_http(WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &pointer, sizeof(pointer)) != FALSE);
+        auto* operation = context.release(); // Released by the request's HANDLE_CLOSING callback.
+        require_http(WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, pointer) != FALSE);
+        wait(*operation, deadline, timeout);
+        require_http(WinHttpReceiveResponse(request, nullptr) != FALSE);
+        wait(*operation, deadline, timeout);
+        return *operation;
+    }
+
+    std::optional<std::wstring> discover_debug_path(INTERNET_PORT port) const {
+        auto request = open_get(L"/json/version");
+        const auto deadline = Clock::now() + std::chrono::seconds(3);
+        constexpr wchar_t timeout[] = L"手动调试端口查询超时";
+        auto& operation = receive_headers(request.get(), deadline, timeout);
+        const DWORD status = status_code(request.get());
+        if (status == 401 || status == 403 || status == 404) {
+            return std::nullopt;
+        }
+        if (status != 200) {
+            throw VideoError{L"手动调试端口返回 HTTP " + std::to_wstring(status)};
+        }
+        std::string body;
+        for (;;) {
+            require_http(WinHttpReadData(request.get(), operation.buffer.data(),
+                static_cast<DWORD>(operation.buffer.size()), nullptr) != FALSE);
+            wait(operation, deadline, timeout);
+            if (operation.body_bytes == 0) break;
+            if (body.size() + operation.body_bytes > 64 * 1024) {
+                throw VideoError{L"手动调试端口返回的浏览器信息过大"};
+            }
+            body.append(operation.buffer.data(), operation.body_bytes);
+        }
+        Object metadata;
+        if (Object::TryParse(winrt::to_hstring(body), metadata)) {
+            const std::wstring url(metadata.GetNamedString(L"webSocketDebuggerUrl", L""));
+            static const std::wregex browser_url(
+                LR"(ws://(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})(/devtools/browser(?:/[a-zA-Z0-9_-]+)?))");
+            std::wsmatch match;
+            if (std::regex_match(url, match, browser_url) && parse_edge_debug_port(match[1].str()) == port) {
+                return match[2].str();
+            }
+        }
+        throw VideoError{L"该端口未返回有效的本机浏览器调试地址"};
+    }
+
     void wait(Operation& op, Clock::time_point deadline,
             const wchar_t* timeout_message = L"等待 Edge 返回画面超时") const {
         const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
@@ -445,7 +625,7 @@ public:
         if (!connection_ && Clock::now() < retry_) return waiting(last_error_);
         try {
             keep_mta_alive();
-            if (!connection_) connection_ = std::make_unique<BrowserConnection>(stop);
+            if (!connection_) connection_ = std::make_unique<BrowserConnection>(s, stop);
             if (session_.empty()) {
                 if (pinned_.empty()) {
                     if (!select_target(s)) return waiting(L"等待符合筛选条件且已解码的 B 站攻略标签页");
@@ -534,11 +714,17 @@ struct VideoSource::Impl {
     Impl(const GuideSettings& options, HANDLE event) : settings(options), stop(event) {}
     VideoFrame read() {
         if (stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return waiting(L"取帧已停止");
-        if (!valid_circle(settings)) return waiting(L"固定小地图区域超出攻略画面");
-        if (settings.capture_mode != CaptureMode::windows) return remote.read(settings, stop);
-        if (!bounded_video_rect(settings.video_rect)) return waiting(L"窗口视频区域无效");
+        const bool desktop_capture = settings.capture_mode == CaptureMode::windows;
+        const bool direct = desktop_capture && settings.window_minimap.has_value();
+        if (!direct && !valid_circle(settings)) return waiting(L"固定小地图区域超出攻略画面");
+        if (!desktop_capture) return remote.read(settings, stop);
+        if (!direct && !bounded_video_rect(settings.video_rect)) return waiting(L"窗口视频区域无效");
         auto frame = window.read(settings, minimap_region(settings), 350, stop);
         if (!frame.image.empty()) {
+            if (direct && std::max(frame.image.cols, frame.image.rows)
+                > std::min(frame.image.cols, frame.image.rows) * 1.15 + 2) {
+                return waiting(L"捕获窗口比例已变化，请重新圈选小地图");
+            }
             const int size = std::max(212, std::min(frame.image.cols, frame.image.rows));
             if (frame.image.size() != cv::Size(size, size))
                 cv::resize(frame.image, frame.image, {size, size}, 0, 0, cv::INTER_LINEAR);
@@ -558,7 +744,15 @@ VideoFrame VideoSource::read() {
     catch (const std::exception& e) { return waiting(std::wstring(winrt::to_hstring(e.what()))); }
 }
 
-VideoFrame preview_edge(const GuideSettings& settings, int timeout_ms, HANDLE stop_event) {
+std::vector<CaptureWindow> available_capture_windows() {
+    auto windows = window_list(false);
+    std::stable_sort(windows.begin(), windows.end(), [](const CaptureWindow& a, const CaptureWindow& b) {
+        return _wcsicmp(a.title.c_str(), b.title.c_str()) < 0;
+    });
+    return windows;
+}
+
+VideoFrame preview_capture_window(const GuideSettings& settings, int timeout_ms, HANDLE stop_event) {
     try { return WindowSource().read(settings, {0, 0, 1, 1}, timeout_ms, stop_event); }
     catch (const std::regex_error&) { return waiting(L"Edge 筛选正则表达式无效"); }
     catch (const winrt::hresult_error& e) { return waiting(std::wstring(e.message())); }

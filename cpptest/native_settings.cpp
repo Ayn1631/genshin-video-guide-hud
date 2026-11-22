@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <locale>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -36,6 +37,19 @@ std::filesystem::path find_assets(const std::filesystem::path& root) {
     return {};
 }
 
+std::uint64_t read_unsigned(const std::filesystem::path& file, const wchar_t* key, std::uint64_t maximum) {
+    const auto text = read_value(file, key, L"");
+    if (text.empty() || text.find_first_not_of(L"0123456789") != std::wstring::npos) {
+        return 0;
+    }
+    try {
+        const auto value = std::stoull(text);
+        return value <= maximum ? value : 0;
+    } catch (const std::out_of_range&) {
+        return 0;
+    }
+}
+
 }
 
 bool valid_assets(const std::filesystem::path& directory) {
@@ -65,6 +79,43 @@ std::optional<double> parse_setting_number(const std::wstring& value) {
     return input.eof() ? std::optional<double>(number) : std::nullopt;
 }
 
+std::optional<std::uint16_t> parse_edge_debug_port(std::wstring_view value) {
+    if (value.empty() || value.size() > 5) {
+        return std::nullopt;
+    }
+    unsigned port = 0;
+    for (const wchar_t digit : value) {
+        if (digit < L'0' || digit > L'9') {
+            return std::nullopt;
+        }
+        port = port * 10 + static_cast<unsigned>(digit - L'0');
+    }
+    if (port == 0 || port > 65535) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint16_t>(port);
+}
+
+std::filesystem::path expand_edge_debug_directory(const std::wstring& value) {
+    if (value.empty()) {
+        return {};
+    }
+    const auto input = value.size() >= 2 && value.front() == L'"' && value.back() == L'"'
+        ? value.substr(1, value.size() - 2) : value;
+    const DWORD required = ExpandEnvironmentStringsW(input.c_str(), nullptr, 0);
+    if (required == 0 || required > 32768) {
+        return {};
+    }
+    std::wstring expanded(required, L'\0');
+    const DWORD written = ExpandEnvironmentStringsW(input.c_str(), expanded.data(), required);
+    if (written == 0 || written > required) {
+        return {};
+    }
+    expanded.resize(written - 1);
+    const std::filesystem::path directory(expanded);
+    return directory.is_absolute() ? directory : std::filesystem::path{};
+}
+
 GuideSettings default_settings(const std::filesystem::path& root) {
     GuideSettings settings;
     settings.assets = find_assets(root);
@@ -91,6 +142,28 @@ GuideSettings load_settings(const std::filesystem::path& root) {
     settings.game_title = read_value(file, L"GameTitle", settings.game_title);
     settings.edge_pattern = read_value(file, L"EdgePattern", settings.edge_pattern);
     settings.capture_mode = static_cast<CaptureMode>(integer(L"CaptureMode", 0, 0, 2));
+    settings.edge_endpoint = static_cast<EdgeEndpointMode>(integer(L"EdgeEndpointMode", 0, 0, 2));
+    settings.edge_debug_directory = read_value(file, L"EdgeDebugDirectory", L"");
+    settings.edge_debug_port = parse_edge_debug_port(read_value(file, L"EdgeDebugPort", L"")).value_or(0);
+    CaptureWindow target;
+    target.handle = static_cast<std::uintptr_t>(read_unsigned(file, L"CaptureWindowHandle",
+        std::numeric_limits<std::uintptr_t>::max()));
+    target.process_id = static_cast<std::uint32_t>(read_unsigned(file, L"CaptureWindowProcess",
+        std::numeric_limits<std::uint32_t>::max()));
+    target.executable = read_value(file, L"CaptureWindowExecutable", L"");
+    target.window_class = read_value(file, L"CaptureWindowClass", L"");
+    target.title = read_value(file, L"CaptureWindowTitle", L"");
+    if (!target.executable.empty() && !target.window_class.empty() && !target.title.empty()) {
+        settings.capture_window = std::move(target);
+    }
+    if (integer(L"UseWindowMinimap", 0, 0, 1)) {
+        const auto bounds = bounded_video_rect({
+            number(L"WindowMinimapX", 0, 0, 1), number(L"WindowMinimapY", 0, 0, 1),
+            number(L"WindowMinimapWidth", 0, 0, 1), number(L"WindowMinimapHeight", 0, 0, 1)});
+        if (bounds) {
+            settings.window_minimap = WindowMinimap{*bounds, number(L"WindowMinimapInset", 0, 0, 0.99)};
+        }
+    }
     settings.video_rect = {
         number(L"VideoX", 0, 0, 1), number(L"VideoY", 0, 0, 1),
         number(L"VideoWidth", 1, 0.01, 1), number(L"VideoHeight", 1, 0.01, 1)};
@@ -127,6 +200,24 @@ void save_settings(const std::filesystem::path& root, const GuideSettings& setti
     write(L"GameTitle", settings.game_title);
     write(L"EdgePattern", settings.edge_pattern);
     number(L"CaptureMode", static_cast<int>(settings.capture_mode));
+    number(L"EdgeEndpointMode", static_cast<int>(settings.edge_endpoint));
+    write(L"EdgeDebugDirectory", settings.edge_debug_directory);
+    number(L"EdgeDebugPort", settings.edge_debug_port);
+    if (const auto& target = settings.capture_window) {
+        write(L"CaptureWindowHandle", std::to_wstring(target->handle));
+        write(L"CaptureWindowProcess", std::to_wstring(target->process_id));
+        write(L"CaptureWindowExecutable", target->executable);
+        write(L"CaptureWindowClass", target->window_class);
+        write(L"CaptureWindowTitle", target->title);
+    }
+    if (const auto& map = settings.window_minimap) {
+        number(L"UseWindowMinimap", 1);
+        number(L"WindowMinimapX", map->bounds.x);
+        number(L"WindowMinimapY", map->bounds.y);
+        number(L"WindowMinimapWidth", map->bounds.width);
+        number(L"WindowMinimapHeight", map->bounds.height);
+        number(L"WindowMinimapInset", map->inset_fraction);
+    }
     number(L"VideoX", settings.video_rect.x);
     number(L"VideoY", settings.video_rect.y);
     number(L"VideoWidth", settings.video_rect.width);
