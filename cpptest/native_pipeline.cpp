@@ -27,12 +27,12 @@ bool stopped(HANDLE stop) {
 }
 
 template<class Operation>
-void paced(HANDLE stop, int fps, Operation operation) {
-    const auto period = std::chrono::milliseconds(1000 / fps);
+void paced(HANDLE stop, double fps, Operation operation) {
+    const auto period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1 / fps));
     while (!stopped(stop)) {
         const auto due = Clock::now() + period;
         operation();
-        const auto rest = std::chrono::duration_cast<std::chrono::milliseconds>(due - Clock::now());
+        const auto rest = std::chrono::ceil<std::chrono::milliseconds>(due - Clock::now());
         if (rest.count() > 0) {
             WaitForSingleObject(stop, static_cast<DWORD>(rest.count()));
         }
@@ -514,7 +514,7 @@ int run_hud_worker(HINSTANCE instance, const GuideSettings& settings,
     const auto windows = hud.windows();
     Pipeline pipeline(settings, root, stop_event, windows);
     pipeline.start();
-    const DWORD interval = 1000 / (std::max(settings.video_fps, settings.player_fps) + 5);
+    const auto interval = static_cast<DWORD>(std::ceil(1000 / hud_fps(settings.video_fps, settings.player_fps)));
     while (!stopped(stop_event)) {
         MSG message{};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {

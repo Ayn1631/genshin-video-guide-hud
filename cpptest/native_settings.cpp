@@ -65,6 +65,12 @@ std::optional<double> parse_setting_number(const std::wstring& value) {
     return input.eof() ? std::optional<double>(number) : std::nullopt;
 }
 
+GuideSettings default_settings(const std::filesystem::path& root) {
+    GuideSettings settings;
+    settings.assets = find_assets(root);
+    return settings;
+}
+
 GuideSettings load_settings(const std::filesystem::path& root) {
     GuideSettings settings;
     const auto file = root / filename;
@@ -89,18 +95,18 @@ GuideSettings load_settings(const std::filesystem::path& root) {
         number(L"VideoX", 0, 0, 1), number(L"VideoY", 0, 0, 1),
         number(L"VideoWidth", 1, 0.01, 1), number(L"VideoHeight", 1, 0.01, 1)};
     settings.video_rect = bounded_video_rect(settings.video_rect).value_or(NormalizedRect{});
-    settings.circle.x = static_cast<float>(number(L"CircleX", settings.circle.x, 0, 639));
-    settings.circle.y = static_cast<float>(number(L"CircleY", settings.circle.y, 0, 359));
-    settings.circle.radius = static_cast<float>(number(L"CircleRadius", settings.circle.radius, 10, 320));
-    settings.inset = number(L"Inset", std::min(settings.inset, settings.circle.radius - 2.0),
-                            0, settings.circle.radius - 2);
-    settings.video_fps = integer(L"VideoFps", settings.video_fps, 1, 60);
-    settings.player_fps = integer(L"PlayerFps", settings.player_fps, 1, 60);
-    settings.local_misses = integer(L"LocalMisses", settings.local_misses, 1, 100);
-    settings.region_misses = integer(L"RegionMisses", settings.region_misses, 1, 100);
-    settings.arrival_distance = number(L"ArrivalDistance", settings.arrival_distance, 0, 1000);
+    settings.circle.x = number(L"CircleX", settings.circle.x, 0, 639);
+    settings.circle.y = number(L"CircleY", settings.circle.y, 0, 359);
+    settings.circle.radius = number(L"CircleRadius", settings.circle.radius, 1, 320);
+    settings.inset = number(L"Inset", std::min(settings.inset, settings.circle.radius - 1),
+                            0, settings.circle.radius - 1);
+    settings.video_fps = number(L"VideoFps", settings.video_fps, min_capture_fps, max_capture_fps);
+    settings.player_fps = number(L"PlayerFps", settings.player_fps, min_capture_fps, max_capture_fps);
+    settings.local_misses = integer(L"LocalMisses", settings.local_misses, 1, max_retry_count);
+    settings.region_misses = integer(L"RegionMisses", settings.region_misses, 1, max_retry_count);
+    settings.arrival_distance = number(L"ArrivalDistance", settings.arrival_distance, 0, max_arrival_distance);
     settings.workers = integer(L"Workers", settings.workers, 1, 32);
-    settings.opencv_threads = integer(L"OpenCvThreads", settings.opencv_threads, 1, 32);
+    settings.opencv_threads = integer(L"OpenCvThreads", settings.opencv_threads, 1, max_opencv_threads);
     settings.cache_indexes = integer(L"CacheIndexes", 1, 0, 1) == 1;
     settings.detailed = integer(L"Detailed", 0, 0, 1) == 1;
     settings.method = static_cast<bgi::Method>(integer(L"Method", 0, 0, 2));

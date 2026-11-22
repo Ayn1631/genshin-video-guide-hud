@@ -59,8 +59,8 @@ void keep_mta_alive() {
 bool valid_circle(const GuideSettings& settings) {
     const auto& c = settings.circle;
     const double half = c.radius - settings.inset;
-    return std::isfinite(c.x) && std::isfinite(c.y) && settings.inset >= 0 && half > 0 &&
-        half <= std::min({double(c.x), double(c.y), 640.0 - c.x, 360.0 - c.y});
+    return std::isfinite(c.x) && std::isfinite(c.y) && settings.inset >= 0 && half >= 1 &&
+        half < std::min({c.x, c.y, 640.0 - c.x, 360.0 - c.y});
 }
 
 NormalizedRect minimap_region(const GuideSettings& settings) {

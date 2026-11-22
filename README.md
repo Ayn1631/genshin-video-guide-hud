@@ -5,8 +5,8 @@
 ## 从 Release 快速开始
 
 1. 下载 [GitHub Release](https://github.com/Ayn1631/genshin-video-guide-hud/releases/latest) 中的 Windows x64 C++ ZIP，完整解压到可写目录。
-2. **双击 `GenshinVideoGuideHUD.exe` 打开配置。** 在「地图资源目录」选择 [BetterGI](https://github.com/babalae/better-genshin-impact/releases) 的 `Assets/Map/Teyvat`。独立地图资源沿用 `Assets/Map` 下的同级目录。
-3. 在日常使用的 Edge 中播放 B 站攻略，再从下表选择取帧方式。固定小地图默认坐标以 640 × 360 的视频内容为基准。小地图位置有偏移时，在配置中调整圆心和半径。
+2. **双击 `GenshinVideoGuideHUD.exe` 打开配置。** 在「高级」的「地图资源目录」选择 [BetterGI](https://github.com/babalae/better-genshin-impact/releases) 的 `Assets/Map/Teyvat`。独立地图资源沿用 `Assets/Map` 下的同级目录。
+3. 在日常使用的 Edge 中播放 B 站攻略，在「Edge 和小地图」选择取帧方式。固定小地图坐标以 640 × 360 的视频内容为基准。小地图位置有偏移时，在同一页调整圆心、半径和内缩。
 4. 点击「应用并启动 HUD」，切回原神的 16:9 游戏主画面。HUD 跟随游戏窗口，在游戏切到后台、遮挡或最小化时隐藏。
 5. **关闭配置窗口即可退出整个程序。** HUD 和后台取帧随之结束。「停止 HUD」可单独结束 HUD 和取帧，方便保留配置窗口。
 
@@ -16,7 +16,7 @@
 | 唤醒模式 | 使用同一个本地调试连接。保持 Edge 窗口还原、攻略标签页选中，视频区域在页面视口内。 |
 | Windows 窗口捕获 | 保持 Edge 还原并选中攻略标签页。点「框选视频…」，在预览中框住视频画面。通过 Windows 窗口捕获读取该区域里的小地图，无需 Edge 调试授权。 |
 
-配置保存在程序同目录的 `guide-settings.ini`。打开「显示详细耗时与帧率」，可以在游戏左侧查看玩家和攻略两条流程的取帧、匹配和视角耗时。
+在「重试与帧率」可以调整攻略和玩家的取帧频率，查看计算后的 HUD 刷新频率，以及设置重试次数和到达距离。开启「详细模式」后，游戏左侧会显示取帧、匹配和视角耗时。配置保存在程序同目录的 `guide-settings.ini`。点击「仅保存」提交参数，或点击「恢复默认」将表单恢复到默认值。
 
 ## 命令行定位
 
