@@ -48,7 +48,7 @@ if(WIN32 AND MSVC)
         NOMINMAX UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
     target_compile_options(GenshinVideoGuideHUD PRIVATE /W4 /utf-8 /permissive-)
     target_link_libraries(GenshinVideoGuideHUD PRIVATE locator_core bgi_window_capture
-        gdiplus gdi32 user32 dwmapi winhttp windowsapp crypt32 ole32 shell32 comctl32 uuid)
+        gdiplus gdi32 user32 dwmapi winhttp windowsapp crypt32 ole32 shell32 comctl32 uuid uxtheme)
     if(TARGET opencv_world)
         add_custom_command(TARGET GenshinVideoGuideHUD POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different

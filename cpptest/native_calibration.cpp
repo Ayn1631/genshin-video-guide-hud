@@ -1,5 +1,6 @@
 #include "native_calibration.hpp"
 
+#include <uxtheme.h>
 #include <windowsx.h>
 #include <opencv2/imgproc.hpp>
 
@@ -70,7 +71,8 @@ struct CapturePreview::Impl {
         const int width = std::min(1120L, work.right - work.left - 36);
         const int height = std::min(760L, work.bottom - work.top - 36);
         const auto title = is_circle() ? L"圈选小地图" : L"框选视频画面";
-        if (!CreateWindowExW(WS_EX_TOOLWINDOW, preview_class, title, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
+        constexpr DWORD style = (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN;
+        if (!CreateWindowExW(WS_EX_TOOLWINDOW, preview_class, title, style,
             work.left + (work.right - work.left - width) / 2,
             work.top + (work.bottom - work.top - height) / 2, width, height,
             parent, nullptr, instance, this)) {
@@ -100,11 +102,13 @@ struct CapturePreview::Impl {
     LRESULT handle(UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_CREATE:
+            buffered_paint_ = SUCCEEDED(BufferedPaintInit());
             controls();
             return 0;
         case WM_SIZE:
             layout();
             fit();
+            InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_DPICHANGED: {
             const auto& area = *reinterpret_cast<const RECT*>(lparam);
@@ -142,14 +146,20 @@ struct CapturePreview::Impl {
             end({GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)}, message == WM_LBUTTONUP);
             return 0;
         case WM_CAPTURECHANGED:
-            if (action_ == PointerAction::selecting) selection_ = previous_;
+            if (action_ == PointerAction::selecting) restore_selection();
             action_ = PointerAction::none;
-            redraw();
             return 0;
         case WM_PAINT: {
             PAINTSTRUCT paint{};
             const HDC dc = BeginPaint(window_, &paint);
-            draw(dc);
+            if (dc && !IsRectEmpty(&paint.rcPaint)) {
+                HDC canvas = nullptr;
+                const auto buffer = buffered_paint_
+                    ? BeginBufferedPaint(dc, &paint.rcPaint, BPBF_COMPATIBLEBITMAP, nullptr, &canvas)
+                    : nullptr;
+                draw(buffer ? canvas : dc);
+                if (buffer) EndBufferedPaint(buffer, TRUE);
+            }
             EndPaint(window_, &paint);
             return 0;
         }
@@ -161,6 +171,10 @@ struct CapturePreview::Impl {
         case WM_NCDESTROY: {
             const auto window = window_;
             window_ = nullptr;
+            if (buffered_paint_) {
+                BufferedPaintUnInit();
+                buffered_paint_ = false;
+            }
             return DefWindowProcW(window, message, wparam, lparam);
         }
         }
@@ -239,6 +253,10 @@ struct CapturePreview::Impl {
             }
         }
         canvas_ = {scaled(14), scaled(77), client.right - scaled(14), client.bottom - scaled(is_circle() ? 102 : 78)};
+        zoom_caption_ = {scaled(263), scaled(38), client.right - scaled(14), scaled(65)};
+        const int info_top = is_circle() ? 98 : 72;
+        info_area_ = {scaled(14), client.bottom - scaled(info_top), client.right - scaled(14),
+                      client.bottom - scaled(info_top - 25)};
     }
 
     POINT canvas_center() const {
@@ -251,7 +269,6 @@ struct CapturePreview::Impl {
                               double(canvas_.bottom - canvas_.top) / pixels_.rows);
         scale_ = fit_scale_;
         clamp_origin();
-        redraw();
     }
 
     void clamp_origin() {
@@ -265,11 +282,14 @@ struct CapturePreview::Impl {
 
     void zoom(POINT anchor, double factor) {
         if (action_ != PointerAction::none || IsRectEmpty(&canvas_)) return;
+        const auto scale = std::clamp(scale_ * factor, fit_scale_, std::max(12.0, fit_scale_));
+        if (scale == scale_) return;
         const auto image_point = source_point(anchor);
-        scale_ = std::clamp(scale_ * factor, fit_scale_, std::max(12.0, fit_scale_));
+        scale_ = scale;
         origin_ = {anchor.x - scale_ * image_point.x, anchor.y - scale_ * image_point.y};
         clamp_origin();
-        redraw();
+        invalidate(canvas_);
+        invalidate(zoom_caption_);
     }
 
     cv::Point2d source_point(POINT point) const {
@@ -322,9 +342,16 @@ struct CapturePreview::Impl {
                 selection_ = {std::min(anchor_.x, point.x), std::min(anchor_.y, point.y),
                               std::abs(point.x - anchor_.x), std::abs(point.y - anchor_.y)};
             }
+            if (!is_circle() || !notice_.empty()) invalidate(info_area_);
             notice_.clear();
         }
-        redraw();
+        invalidate(canvas_);
+    }
+
+    void restore_selection() {
+        selection_ = previous_;
+        invalidate(canvas_);
+        if (!is_circle()) invalidate(info_area_);
     }
 
     void end(POINT pointer, bool left) {
@@ -335,12 +362,11 @@ struct CapturePreview::Impl {
         ReleaseCapture();
         if (left) {
             if (selection_.width < minimum_diameter || selection_.height < minimum_diameter) {
-                selection_ = previous_;
+                restore_selection();
             } else if (is_circle()) {
                 write_circle_inputs();
             }
         }
-        redraw();
     }
 
     std::optional<double> input_number(int id) const {
@@ -389,7 +415,7 @@ struct CapturePreview::Impl {
         if (action_ != PointerAction::none || !bounded || selection_.width < min_width || selection_.height < min_height) {
             notice_ = is_circle() ? L"请设置圆心和半径。圆须完整位于原图内，半径至少 4 px。"
                                   : L"请框出完整的视频画面。";
-            redraw();
+            invalidate(info_area_);
             return;
         }
         double fraction = 0;
@@ -397,7 +423,7 @@ struct CapturePreview::Impl {
             const auto inset = input_number(inset_input);
             if (!inset || *inset < 0 || *inset > selection_.width / 2 - 2) {
                 notice_ = L"内缩须为非负像素，且至少保留 2 像素半径。";
-                redraw();
+                invalidate(info_area_);
                 return;
             }
             fraction = *inset / (selection_.width / 2);
@@ -415,23 +441,29 @@ struct CapturePreview::Impl {
                 return;
             }
             notice_.clear();
-            redraw();
+            invalidate(canvas_);
+            invalidate(info_area_);
         } else if (notification == BN_CLICKED) {
             switch (id) {
             case zoom_out: zoom(canvas_center(), 0.8); break;
             case zoom_in: zoom(canvas_center(), 1.25); break;
-            case zoom_fit: fit(); break;
+            case zoom_fit:
+                fit();
+                invalidate(canvas_);
+                invalidate(zoom_caption_);
+                break;
             case IDCANCEL: DestroyWindow(window_); break;
             case IDOK: accept(); break;
             }
         }
     }
 
-    void redraw() {
-        if (window_) InvalidateRect(window_, nullptr, FALSE);
+    void invalidate(const RECT& area) {
+        if (window_) InvalidateRect(window_, &area, FALSE);
     }
 
     void draw_text(HDC dc, const std::wstring& text, RECT area, COLORREF color) const {
+        if (text.empty() || !RectVisible(dc, &area)) return;
         const auto previous = SelectObject(dc, font_ ? font_ : GetStockObject(DEFAULT_GUI_FONT));
         SetTextColor(dc, color);
         SetBkMode(dc, TRANSPARENT);
@@ -492,13 +524,12 @@ struct CapturePreview::Impl {
         RECT client{};
         GetClientRect(window_, &client);
         FillRect(dc, &client, GetSysColorBrush(COLOR_BTNFACE));
-        draw_image(dc);
+        if (RectVisible(dc, &canvas_)) draw_image(dc);
         const auto ink = GetSysColor(COLOR_WINDOWTEXT);
         const auto hint = is_circle() ? L"直接输入坐标，或左键从圆心拖到圆边。滚轮缩放，右键平移。"
                                        : L"左键沿边缘框住整个视频画面。滚轮缩放，右键拖动平移。";
         draw_text(dc, hint, {scaled(14), scaled(8), client.right - scaled(14), scaled(32)}, ink);
-        draw_text(dc, std::to_wstring(std::lround(scale_ * 100)) + L"%",
-            {scaled(263), scaled(38), client.right - scaled(14), scaled(65)}, ink);
+        draw_text(dc, std::to_wstring(std::lround(scale_ * 100)) + L"%", zoom_caption_, ink);
         std::wstring info = notice_;
         if (info.empty()) {
             if (is_circle()) {
@@ -509,9 +540,7 @@ struct CapturePreview::Impl {
                 info = L"视频区域  ·  " + w + L" × " + std::to_wstring(pixel(selection_.height)) + L" px";
             }
         }
-        const auto from_bottom = is_circle() ? 98 : 72;
-        draw_text(dc, info, {scaled(14), client.bottom - scaled(from_bottom), client.right - scaled(14),
-                             client.bottom - scaled(from_bottom - 25)}, ink);
+        draw_text(dc, info, info_area_, ink);
     }
 
     CalibrationKind kind_;
@@ -521,8 +550,9 @@ struct CapturePreview::Impl {
     cv::Rect2d selection_, previous_;
     cv::Point2d origin_, anchor_;
     POINT pan_anchor_{};
-    RECT canvas_{};
+    RECT canvas_{}, zoom_caption_{}, info_area_{};
     double scale_ = 1, fit_scale_ = 1, inset_ = 3;
+    bool buffered_paint_ = false;
     bool syncing_circle_ = false;
     PointerAction action_ = PointerAction::none;
     std::wstring notice_;
