@@ -64,6 +64,7 @@ inline std::optional<NormalizedRect> bounded_video_rect(NormalizedRect rect) {
 struct GuideSettings {
     std::filesystem::path assets;
     std::wstring game_title = L"原神";
+    bool hide_when_covered = true;
     std::wstring edge_pattern = L"bilibili\\.com";
     CaptureMode capture_mode = CaptureMode::remote;
     EdgeEndpointMode edge_endpoint = EdgeEndpointMode::automatic;

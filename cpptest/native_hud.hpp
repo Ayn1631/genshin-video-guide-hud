@@ -34,7 +34,7 @@ public:
     ~Hud();
 
     std::vector<HWND> windows() const;
-    void show(const RECT& game, const HudView& view);
+    void show(const RECT& game, const HudView& view, bool restore_z_order = false);
     void hide() noexcept;
 
 private:

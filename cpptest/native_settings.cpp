@@ -140,6 +140,7 @@ GuideSettings load_settings(const std::filesystem::path& root) {
         settings.assets = root / settings.assets;
     }
     settings.game_title = read_value(file, L"GameTitle", settings.game_title);
+    settings.hide_when_covered = integer(L"HideWhenCovered", 1, 0, 1) == 1;
     settings.edge_pattern = read_value(file, L"EdgePattern", settings.edge_pattern);
     settings.capture_mode = static_cast<CaptureMode>(integer(L"CaptureMode", 0, 0, 2));
     settings.edge_endpoint = static_cast<EdgeEndpointMode>(integer(L"EdgeEndpointMode", 0, 0, 2));
@@ -198,6 +199,7 @@ void save_settings(const std::filesystem::path& root, const GuideSettings& setti
     };
     write(L"Assets", settings.assets.wstring());
     write(L"GameTitle", settings.game_title);
+    number(L"HideWhenCovered", settings.hide_when_covered);
     write(L"EdgePattern", settings.edge_pattern);
     number(L"CaptureMode", static_cast<int>(settings.capture_mode));
     number(L"EdgeEndpointMode", static_cast<int>(settings.edge_endpoint));

@@ -1,5 +1,6 @@
 #include "native_types.hpp"
 #include "native_calibration.hpp"
+#include "native_startup_log.hpp"
 #include "native_video.hpp"
 
 #include <commctrl.h>
@@ -41,7 +42,7 @@ enum Control : int {
     method, workers, opencv_threads, cache_indexes, detailed, status,
     save, stop, start, settings_tabs, restore, edge_help, filter_label, hud_rate, hud_rate_caption,
     video_rect_status, hud_rate_formula, debug_mode, debug_directory, debug_browse, debug_port,
-    capture_window, select_minimap, minimap_help
+    capture_window, select_minimap, minimap_help, hide_when_covered
 };
 
 enum class Page { tracking, edge, advanced, shared };
@@ -148,31 +149,43 @@ public:
 
     bool open(const std::filesystem::path& exe) {
         close();
+        const auto root = exe.parent_path();
+        guide::write_hud_startup_log(root, L"设置窗口已提交 HUD 启动请求。", true);
+        const auto failed = [&](std::wstring_view stage, DWORD error) {
+            guide::write_hud_startup_log(root, std::wstring(stage) + L"失败。Win32 错误码 " +
+                                             std::to_wstring(error) + L"。");
+            return false;
+        };
         const auto name = L"Local\\GenshinVideoGuideHUD.Stop." + std::to_wstring(GetCurrentProcessId());
         Handle stop_event(CreateEventW(nullptr, TRUE, FALSE, name.c_str()));
+        if (!stop_event) {
+            return failed(L"创建停止事件", GetLastError());
+        }
         Handle job(CreateJobObjectW(nullptr, nullptr));
-        if (!stop_event || !job) {
-            return false;
+        if (!job) {
+            return failed(L"创建 HUD 作业对象", GetLastError());
         }
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
-            return false;
+            return failed(L"配置 HUD 作业对象", GetLastError());
         }
         auto command = L"\"" + exe.wstring() + L"\" --hud " + name;
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         PROCESS_INFORMATION pi{};
         if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE,
-                            CREATE_SUSPENDED, nullptr, exe.parent_path().c_str(), &startup, &pi)) {
-            return false;
+                            CREATE_SUSPENDED, nullptr, root.c_str(), &startup, &pi)) {
+            return failed(L"创建 HUD 子进程", GetLastError());
         }
         Handle process(pi.hProcess);
         Handle thread(pi.hThread);
-        if (!AssignProcessToJobObject(job.get(), process.get()) || ResumeThread(thread.get()) == DWORD(-1)) {
+        const bool assigned = AssignProcessToJobObject(job.get(), process.get()) != FALSE;
+        if (!assigned || ResumeThread(thread.get()) == DWORD(-1)) {
+            const auto error = GetLastError();
             TerminateProcess(process.get(), 1);
             WaitForSingleObject(process.get(), 450);
-            return false;
+            return failed(assigned ? L"恢复 HUD 子线程" : L"将 HUD 子进程放入作业对象", error);
         }
         stop_ = std::move(stop_event);
         job_ = std::move(job);
@@ -182,6 +195,11 @@ public:
 
     bool exited() const {
         return process_ && WaitForSingleObject(process_.get(), 0) == WAIT_OBJECT_0;
+    }
+
+    std::optional<DWORD> exit_code() const {
+        DWORD code = 0;
+        return GetExitCodeProcess(process_.get(), &code) ? std::optional<DWORD>(code) : std::nullopt;
     }
 
     void close() {
@@ -544,6 +562,7 @@ private:
         edit(page, assets, {276, 400, 334, 34});
         button(page, L"浏览…", browse, {622, 400, 90, 34});
         label(page, L"选择 BetterGI 的 Assets/Map/Teyvat 目录。", {276, 443, 436, 22}, Font::note);
+        checkbox(page, L"其他窗口遮挡游戏时隐藏 HUD", hide_when_covered, {56, 475, 450, 28});
     }
 
     void write_form(const GuideSettings& settings) {
@@ -553,6 +572,7 @@ private:
         populate_capture_windows();
         SetDlgItemTextW(window_, assets, settings.assets.c_str());
         SetDlgItemTextW(window_, game_title, settings.game_title.c_str());
+        CheckDlgButton(window_, hide_when_covered, settings.hide_when_covered ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemTextW(window_, edge_filter, settings.edge_pattern.c_str());
         SendDlgItemMessageW(window_, edge_mode, CB_SETCURSEL, static_cast<int>(settings.capture_mode), 0);
         SendDlgItemMessageW(window_, debug_mode, CB_SETCURSEL, static_cast<int>(settings.edge_endpoint), 0);
@@ -1047,6 +1067,7 @@ private:
         if (settings.game_title.empty()) {
             throw FieldError{game_title, L"请填写游戏窗口名称。"};
         }
+        settings.hide_when_covered = IsDlgButtonChecked(window_, hide_when_covered) == BST_CHECKED;
         settings.capture_mode = static_cast<guide::CaptureMode>(SendMessageW(item(edge_mode), CB_GETCURSEL, 0, 0));
         settings.capture_window = capture_target_;
         settings.window_minimap = draft_minimap_;
@@ -1192,9 +1213,9 @@ private:
                 const bool running = hud_.open(exe_);
                 EnableWindow(item(stop), running);
                 const bool windows = settings_.capture_mode == guide::CaptureMode::windows;
-                set_status(running ? (windows ? L"HUD 已启动，正在连接 Windows 捕获。"
-                                             : L"HUD 已启动，必要时在当前 Edge 允许本地连接。")
-                                   : L"无法启动 HUD 进程，请重试。", running ? Status::running : Status::error);
+                set_status(running ? (windows ? L"HUD 已启动。显示状态见同目录的 hud-startup.log。"
+                                             : L"HUD 已启动。按需允许 Edge 连接，详情见 hud-startup.log。")
+                                   : L"无法启动 HUD 进程。详情见 hud-startup.log。", running ? Status::running : Status::error);
             } else {
                 set_status(L"配置已保存。点「应用并启动 HUD」即可应用到 HUD。");
             }
@@ -1205,9 +1226,12 @@ private:
 
     void tick() {
         if (hud_.exited()) {
+            const auto code = hud_.exit_code();
+            guide::write_hud_startup_log(root_, code ? L"设置窗口检测到 HUD 子进程退出。退出码 " +
+                std::to_wstring(*code) + L"。" : L"设置窗口检测到 HUD 子进程退出。无法读取退出码。");
             hud_.close();
             EnableWindow(item(stop), FALSE);
-            set_status(L"HUD 已退出，请检查运行库或地图目录后重试。", Status::error);
+            set_status(L"HUD 已退出。详情见同目录的 hud-startup.log。", Status::error);
         }
         if (preview_ && !preview_->open()) {
             if (const auto& selection = preview_->result()) {
@@ -1275,20 +1299,31 @@ private:
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     bool internal = false;
+    std::filesystem::path hud_root;
     try {
         const auto exe = executable();
         int count = 0;
         auto args = CommandLineToArgvW(GetCommandLineW(), &count);
         internal = args && count == 3 && std::wstring_view(args[1]) == L"--hud";
         if (internal) {
+            hud_root = exe.parent_path();
+            guide::write_hud_startup_log(hud_root, L"HUD 子进程已进入。");
             Handle event(OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, args[2]));
+            const DWORD error = event ? ERROR_SUCCESS : GetLastError();
             LocalFree(args);
             if (!event) {
+                guide::write_hud_startup_log(hud_root, L"HUD 无法打开停止事件。Win32 错误码 " +
+                                                         std::to_wstring(error) + L"。");
                 return 1;
             }
-            const auto settings = guide::load_settings(exe.parent_path());
-            return guide::valid_assets(settings.assets)
-                ? guide::run_hud_worker(instance, settings, exe.parent_path(), event.get()) : 1;
+            const auto settings = guide::load_settings(hud_root);
+            if (!guide::valid_assets(settings.assets)) {
+                guide::write_hud_startup_log(hud_root, L"HUD 读取到的地图目录无效。");
+                return 1;
+            }
+            const int result = guide::run_hud_worker(instance, settings, hud_root, event.get());
+            guide::write_hud_startup_log(hud_root, L"HUD 子进程已停止。");
+            return result;
         }
         LocalFree(args);
         Handle singleton(CreateMutexW(nullptr, FALSE, L"Local\\GenshinVideoGuideHUD.Settings.v1"));
@@ -1324,8 +1359,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, wchar_t*, int show) {
             CoUninitialize();
         }
         return result == 0 ? 0 : 1;
-    } catch (const std::exception&) {
-        if (!internal) {
+    } catch (const std::exception& error) {
+        if (internal && !hud_root.empty()) {
+            guide::write_hud_startup_log(hud_root, L"HUD 子进程异常退出。" + guide::hud_runtime_error(error));
+        } else if (!internal) {
             MessageBoxW(nullptr, L"无法启动配置窗口。", window_title, MB_ICONERROR);
         }
         return 1;

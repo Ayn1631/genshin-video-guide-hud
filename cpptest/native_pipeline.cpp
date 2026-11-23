@@ -1,6 +1,7 @@
 #include "native_types.hpp"
 #include "native_game.hpp"
 #include "native_hud.hpp"
+#include "native_startup_log.hpp"
 #include "native_video.hpp"
 
 #include <opencv2/core/ocl.hpp>
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cwchar>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -388,7 +390,7 @@ private:
         GameSource source(settings_.assets);
         paced(stop_, settings_.player_fps, [&] {
             const auto start = Clock::now();
-            const auto game = foreground_game(settings_.game_title, windows_);
+            const auto game = foreground_game(settings_.game_title, windows_, settings_.hide_when_covered).game;
             auto image = game ? source.read(*game) : cv::Mat{};
             auto status = image.empty() ? L"游戏画面未检测到小地图" : L"";
             publish(game_frames_, player_, std::move(image), status, start);
@@ -506,6 +508,64 @@ private:
     std::vector<std::thread> threads_;
 };
 
+std::wstring window_details(HWND window, bool include_game_title) {
+    if (!window) return {};
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    std::wstring details = L" PID=" + std::to_wstring(pid);
+    wchar_t styles[11]{};
+    std::swprintf(styles, ARRAYSIZE(styles), L"0x%08lX", static_cast<unsigned long>(GetWindowLongPtrW(window, GWL_EXSTYLE)));
+    details += L"，扩展样式=";
+    details += styles;
+    wchar_t window_class[256]{};
+    if (GetClassNameW(window, window_class, ARRAYSIZE(window_class))) {
+        details += L"，窗口类=";
+        details += window_class;
+    }
+    const auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return details;
+
+    wchar_t path[MAX_PATH]{};
+    DWORD length = ARRAYSIZE(path);
+    const bool has_path = QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
+    CloseHandle(process);
+    if (!has_path) return details;
+
+    const auto separator = std::wcsrchr(path, L'\\');
+    const auto executable = separator ? separator + 1 : path;
+    details += L"，进程=";
+    details += executable;
+    if (include_game_title && (_wcsicmp(executable, L"YuanShen.exe") == 0 ||
+                               _wcsicmp(executable, L"GenshinImpact.exe") == 0)) {
+        wchar_t title[256]{};
+        if (GetWindowTextW(window, title, ARRAYSIZE(title))) {
+            details += L"，实际游戏标题=";
+            details += title;
+        }
+    }
+    return details;
+}
+
+std::wstring hud_visibility_message(const ForegroundGame& foreground, const std::wstring& expected_title,
+                                   HWND overlay) {
+    switch (foreground.state) {
+    case ForegroundState::no_window:
+        return L"HUD 已隐藏。当前没有可用的前台窗口。";
+    case ForegroundState::title_mismatch:
+        return L"HUD 已隐藏。前台窗口标题与设置不一致，预期标题=" + expected_title +
+               L"。" + window_details(foreground.related_window, true);
+    case ForegroundState::unavailable:
+        return L"HUD 已隐藏。游戏窗口已切离前台、最小化或客户区不可用。";
+    case ForegroundState::covered:
+        return L"HUD 已隐藏。检测到上层窗口与游戏区域重叠。" +
+               window_details(foreground.related_window, false);
+    case ForegroundState::ready:
+        return IsWindowVisible(overlay) ? L"方向 HUD 已提交绘制，Windows 窗口已设为可见。"
+                                        : L"游戏窗口通过检查，方向 HUD 窗口仍未显示。";
+    }
+    return {};
+}
+
 }
 
 int run_hud_worker(HINSTANCE instance, const GuideSettings& settings,
@@ -514,9 +574,13 @@ int run_hud_worker(HINSTANCE instance, const GuideSettings& settings,
     cv::ocl::setUseOpenCL(false);
     Hud hud(instance);
     const auto windows = hud.windows();
+    write_hud_startup_log(root, L"HUD 窗口已创建，开始检查前台游戏窗口。");
     Pipeline pipeline(settings, root, stop_event, windows);
     pipeline.start();
     const auto interval = static_cast<DWORD>(std::ceil(1000 / hud_fps(settings.video_fps, settings.player_fps)));
+    std::optional<ForegroundState> last_state;
+    HWND last_window = nullptr;
+    bool logged_z_order_restore = false;
     while (!stopped(stop_event)) {
         MSG message{};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -527,10 +591,20 @@ int run_hud_worker(HINSTANCE instance, const GuideSettings& settings,
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        if (const auto game = foreground_game(settings.game_title, windows)) {
-            hud.show(game->bounds, pipeline.view(game->bounds));
+        const auto foreground = foreground_game(settings.game_title, windows, settings.hide_when_covered);
+        if (const auto& game = foreground.game) {
+            hud.show(game->bounds, pipeline.view(game->bounds), foreground.hud_below_game);
+            if (foreground.hud_below_game && !logged_z_order_restore) {
+                write_hud_startup_log(root, L"检测到浮层排在游戏窗口下方，已重新设置桌面置顶。");
+                logged_z_order_restore = true;
+            }
         } else {
             hud.hide();
+        }
+        if (last_state != foreground.state || last_window != foreground.related_window) {
+            write_hud_startup_log(root, hud_visibility_message(foreground, settings.game_title, windows.front()));
+            last_state = foreground.state;
+            last_window = foreground.related_window;
         }
         MsgWaitForMultipleObjects(1, &stop_event, FALSE, interval, QS_ALLINPUT);
     }

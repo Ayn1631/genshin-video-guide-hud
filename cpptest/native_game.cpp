@@ -41,6 +41,19 @@ bool is_cloaked(HWND hwnd) {
     return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0;
 }
 
+bool is_click_through_or_fully_transparent(HWND hwnd) {
+    const auto style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!(style & WS_EX_LAYERED)) {
+        return false;
+    }
+    if (style & WS_EX_TRANSPARENT) {
+        return true;
+    }
+    BYTE alpha = 255;
+    DWORD flags = 0;
+    return GetLayeredWindowAttributes(hwnd, nullptr, &alpha, &flags) && (flags & LWA_ALPHA) && alpha == 0;
+}
+
 std::optional<RECT> foreground_bounds(HWND hwnd) {
     if (!hwnd || hwnd != GetForegroundWindow() || !IsWindowVisible(hwnd) || IsIconic(hwnd) || is_cloaked(hwnd)) {
         return std::nullopt;
@@ -54,12 +67,18 @@ std::optional<RECT> foreground_bounds(HWND hwnd) {
     return client;
 }
 
-bool is_covered(HWND hwnd, const RECT& bounds, const std::vector<HWND>& excluded) {
+struct WindowOrder {
+    HWND covering_window = nullptr;
+    bool hud_below_game = false;
+};
+
+WindowOrder window_order(HWND hwnd, const RECT& bounds, const std::vector<HWND>& hud_windows,
+                         bool hide_when_covered) {
     std::unordered_set<HWND> visited{hwnd};
     for (HWND above = GetWindow(hwnd, GW_HWNDPREV); above && visited.insert(above).second;
          above = GetWindow(above, GW_HWNDPREV)) {
-        if (!IsWindowVisible(above) || IsIconic(above) ||
-            std::find(excluded.begin(), excluded.end(), above) != excluded.end()) {
+        if (!hide_when_covered || !IsWindowVisible(above) || IsIconic(above) ||
+            std::find(hud_windows.begin(), hud_windows.end(), above) != hud_windows.end()) {
             continue;
         }
 
@@ -68,11 +87,15 @@ bool is_covered(HWND hwnd, const RECT& bounds, const std::vector<HWND>& excluded
             !GetWindowRect(above, &frame)) {
             continue;
         }
-        if (IntersectRect(&overlap, &bounds, &frame) && !is_cloaked(above)) {
-            return true;
+        if (IntersectRect(&overlap, &bounds, &frame) && !is_cloaked(above) &&
+            !is_click_through_or_fully_transparent(above)) {
+            return {above};
         }
     }
-    return false;
+    const bool hud_below_game = std::any_of(hud_windows.begin(), hud_windows.end(), [&](HWND overlay) {
+        return visited.find(overlay) == visited.end() && IsWindowVisible(overlay);
+    });
+    return {nullptr, hud_below_game};
 }
 
 class MonitorCoverage {
@@ -367,26 +390,31 @@ std::optional<double> edge_heading(const cv::Mat& normalized) {
 
 }
 
-std::optional<GameWindow> foreground_game(const std::wstring& title, const std::vector<HWND>& excluded) {
+ForegroundGame foreground_game(const std::wstring& title, const std::vector<HWND>& excluded,
+                               bool hide_when_covered) {
     const PhysicalPixels physical_pixels;
     const HWND hwnd = GetForegroundWindow();
     if (!hwnd || title.empty() || std::find(excluded.begin(), excluded.end(), hwnd) != excluded.end()) {
-        return std::nullopt;
+        return {{}, ForegroundState::no_window};
     }
     const int length = GetWindowTextLengthW(hwnd);
     if (length <= 0) {
-        return std::nullopt;
+        return {{}, ForegroundState::title_mismatch, hwnd};
     }
     std::wstring actual_title(static_cast<std::size_t>(length) + 1, L'\0');
     if (!GetWindowTextW(hwnd, actual_title.data(), length + 1) ||
         CompareStringOrdinal(actual_title.c_str(), -1, title.c_str(), -1, TRUE) != CSTR_EQUAL) {
-        return std::nullopt;
+        return {{}, ForegroundState::title_mismatch, hwnd};
     }
     const auto bounds = foreground_bounds(hwnd);
-    if (!bounds || is_covered(hwnd, *bounds, excluded)) {
-        return std::nullopt;
+    if (!bounds) {
+        return {{}, ForegroundState::unavailable, hwnd};
     }
-    return GameWindow{hwnd, *bounds};
+    const auto order = window_order(hwnd, *bounds, excluded, hide_when_covered);
+    if (order.covering_window) {
+        return {{}, ForegroundState::covered, order.covering_window};
+    }
+    return {GameWindow{hwnd, *bounds}, ForegroundState::ready, hwnd, order.hud_below_game};
 }
 
 std::optional<RECT> game_minimap_rect(const RECT& game_client) {

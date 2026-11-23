@@ -9,3 +9,7 @@
 Windows 发布包随附 OpenCV 4.10.0 x64 SDK 的 `opencv_world4100.dll`，其许可证随包保存在 `OpenCV-LICENSE.txt`。对应源码与官方 SDK 见 [OpenCV 4.10.0](https://github.com/opencv/opencv/releases/tag/4.10.0)。
 
 发布包的项目源码及构建脚本由对应的 Git 标签提供。[源码与发行版](https://github.com/Ayn1631/genshin-video-guide-hud/releases)
+
+## Microsoft Visual C++ 运行库
+
+Windows 发布包随附 Visual Studio 2022 的 x64 可再发行运行库，相关声明见随包的 `MSVC-REDIST-NOTICE.txt`。[Microsoft 再分发说明](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)

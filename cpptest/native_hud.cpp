@@ -199,7 +199,8 @@ public:
 
     HWND window() const noexcept { return window_; }
 
-    void show(const RECT& bounds, const Content& content, void (*paint)(Graphics&, int, int, const Content&)) {
+    void show(const RECT& bounds, const Content& content, void (*paint)(Graphics&, int, int, const Content&),
+              bool restore_z_order) {
         const int width = bounds.right - bounds.left;
         const int height = bounds.bottom - bounds.top;
         const bool resized = !surface_.matches(width, height);
@@ -217,7 +218,7 @@ public:
             surface_.upload(window_, bounds);
             bounds_ = bounds;
         }
-        if (!visible_) {
+        if (!visible_ || restore_z_order) {
             if (!SetWindowPos(window_, HWND_TOPMOST, 0, 0, 0, 0,
                               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
                 throw_last_error("Could not show a HUD window");
@@ -555,7 +556,7 @@ std::vector<HWND> Hud::windows() const {
     return {impl_->compass.window(), impl_->marker.window(), impl_->diagnostics.window()};
 }
 
-void Hud::show(const RECT& game, const HudView& view) {
+void Hud::show(const RECT& game, const HudView& view, bool restore_z_order) {
     const auto width = static_cast<long long>(game.right) - game.left;
     const auto height = static_cast<long long>(game.bottom) - game.top;
     if (width < 2 || height < 2 || width > std::numeric_limits<int>::max() ||
@@ -578,7 +579,7 @@ void Hud::show(const RECT& game, const HudView& view) {
 
     try {
         impl_->compass.show(compass_rect, {view.title, view.detail, format_distance(view.distance), angle},
-                            paint_compass);
+                            paint_compass, restore_z_order);
         if (view.marker && PtInRect(&game, *view.marker)) {
             const LONG x = view.marker->x;
             const LONG y = view.marker->y;
@@ -592,7 +593,8 @@ void Hud::show(const RECT& game, const HudView& view) {
             if (finite(view.marker_heading)) {
                 heading = std::round(std::fmod(*view.marker_heading, 360.0) / 5.0) * 5.0;
             }
-            impl_->marker.show(marker_rect, {{x - marker_rect.left, y - marker_rect.top}, heading}, paint_marker);
+            impl_->marker.show(marker_rect, {{x - marker_rect.left, y - marker_rect.top}, heading},
+                              paint_marker, restore_z_order);
         } else {
             impl_->marker.hide();
         }
@@ -608,7 +610,7 @@ void Hud::show(const RECT& game, const HudView& view) {
             const auto timing_rect = diagnostics_bounds(game, static_cast<int>(width), static_cast<int>(height),
                                                         layout->height);
             if (timing_rect) {
-                impl_->diagnostics.show(*timing_rect, *layout, paint_diagnostics);
+                impl_->diagnostics.show(*timing_rect, *layout, paint_diagnostics, restore_z_order);
             } else {
                 impl_->diagnostics.hide();
             }

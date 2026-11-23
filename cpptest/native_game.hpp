@@ -19,7 +19,17 @@ struct GameWindow {
     RECT bounds;
 };
 
-std::optional<GameWindow> foreground_game(const std::wstring& title, const std::vector<HWND>& excluded);
+enum class ForegroundState { no_window, title_mismatch, unavailable, covered, ready };
+
+struct ForegroundGame {
+    std::optional<GameWindow> game;
+    ForegroundState state;
+    HWND related_window = nullptr;
+    bool hud_below_game = false;
+};
+
+ForegroundGame foreground_game(const std::wstring& title, const std::vector<HWND>& excluded,
+                               bool hide_when_covered = true);
 std::optional<RECT> game_minimap_rect(const RECT& game_client);
 
 class GameSource {

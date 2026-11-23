@@ -7,7 +7,7 @@
 1. 下载 [GitHub Release](https://github.com/Ayn1631/genshin-video-guide-hud/releases/latest) 中的 Windows x64 C++ ZIP，完整解压到可写目录。
 2. **双击 `GenshinVideoGuideHUD.exe` 打开配置。** 在「高级」的「地图资源目录」选择 [BetterGI](https://github.com/babalae/better-genshin-impact/releases) 的 `Assets/Map/Teyvat`。独立地图资源沿用 `Assets/Map` 下的同级目录。
 3. 在日常使用的 Edge 中播放 B 站攻略，在「Edge 和小地图」选择取帧方式。固定小地图坐标以 640 × 360 的视频内容为基准。小地图位置有偏移时，在同一页调整圆心、半径和内缩。
-4. 点击「应用并启动 HUD」，切回原神的 16:9 游戏主画面。HUD 跟随游戏窗口，在游戏切到后台、遮挡或最小化时隐藏。
+4. 点击「应用并启动 HUD」，切回原神的 16:9 游戏主画面。HUD 会在游戏切到后台或最小化时隐藏，默认也会在游戏被普通窗口遮挡时隐藏。
 5. **关闭配置窗口即可退出整个程序。** HUD 和后台取帧随之结束。「停止 HUD」可单独结束 HUD 和取帧，方便保留配置窗口。
 
 | 取帧方式 | 使用方法 |
@@ -33,6 +33,12 @@ Windows 捕获可选已打开的浏览器或播放器窗口，也可由工具自
 
 在「重试与帧率」可以调整攻略和玩家的取帧频率，查看计算后的 HUD 刷新频率，以及设置重试次数和到达距离。开启「详细模式」后，游戏左侧会显示取帧、匹配和视角耗时。配置保存在程序同目录的 `guide-settings.ini`。点击「仅保存」提交参数，或点击「恢复默认」将表单恢复到默认值。
 
+### HUD 显示诊断
+
+鼠标可穿透的分层浮层和整窗透明度为 0 的分层窗口可与 HUD 同时显示。若某个悬浮窗仍被判定为遮挡，可在「高级」取消「其他窗口遮挡游戏时隐藏 HUD」，再点击「应用并启动 HUD」。
+
+HUD 未显示时，可查看 EXE 同目录的 `hud-startup.log`。日志记录 HUD 启动、隐藏原因、遮挡窗口和退出状态。运行中会追加到同一文件，每次点击「应用并启动 HUD」都会重写该文件。
+
 ## 命令行定位
 
 如需单独定位截图，在解压目录打开 PowerShell，将地图目录和图片路径改为本机路径后运行。
@@ -53,7 +59,7 @@ Windows 捕获可选已打开的浏览器或播放器窗口，也可由工具自
 | `bgi_window_capture.dll` | 供集成调用的 Windows Graphics Capture 取帧接口，入口见 [`cpptest/window_capture.cpp`](cpptest/window_capture.cpp) |
 | `opencv_world4100.dll` | OpenCV 4.10.0 原生运行库 |
 
-发布包自带 OpenCV 运行库。系统提示缺少 `MSVCP140.dll` 或 `VCRUNTIME140.dll` 时，安装微软的 x64 v14 运行库。[Microsoft 官方下载](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist/)
+发布包附带 OpenCV 和 Microsoft Visual C++ x64 运行库。完整解压后即可打开配置界面。
 
 ## 构建源码
 
